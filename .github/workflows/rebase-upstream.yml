@@ -1,0 +1,39 @@
+name: Rebase Upstream
+
+# Keeps this fork's packaging branch on top of drandyhaas/KiCadRoutingTools
+# main: rebases the packaging commits onto upstream and force-pushes.
+# Fails (and pushes nothing) on a conflict -- resolve locally then.
+#
+# Scheduled workflows only run from the repository's DEFAULT branch, so set
+# this branch as the fork's default (Settings -> General -> Default branch),
+# or trigger it by hand from the Actions tab.
+#
+# Upstream commits to .github/workflows/ can only be pushed with a token that
+# has the `workflow` scope; GITHUB_TOKEN cannot. Add a fine-grained PAT
+# (Contents: read/write, Workflows: read/write on this repo) as the secret
+# REBASE_TOKEN. Without it the job falls back to GITHUB_TOKEN, which works
+# until upstream touches a workflow file.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"  # daily; upstream lands ~20 commits/day
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: pypi
+          fetch-depth: 0  # full history: the rebase needs the merge base
+          token: ${{ secrets.REBASE_TOKEN || github.token }}
+      - uses: imba-tjd/rebase-upstream-action@master
+        with:
+          upstream: drandyhaas/KiCadRoutingTools
+          branch: main
+          depth: 0
+          token: ${{ secrets.REBASE_TOKEN || github.token }}

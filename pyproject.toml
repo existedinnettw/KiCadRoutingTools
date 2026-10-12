@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kicad-routing-tools"
+dynamic = ["version"]
+description = "KiCad PCB autorouter, placer and board checkers (packaged fork of drandyhaas/KiCadRoutingTools)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+# Mirrors requirements.txt (startup_checks reads the floors from that file).
+dependencies = [
+    "numpy>=1.22.0",
+    "scipy>=1.7.0",
+    "shapely>=2.0",
+    "Pillow>=9.2.0",
+]
+
+[project.optional-dependencies]
+mp4 = ["imageio", "imageio-ffmpeg"]
+
+[project.urls]
+Upstream = "https://github.com/drandyhaas/KiCadRoutingTools"
+
+[project.scripts]
+krt = "kicad_routing_tools._cli:main"
+krt-route = "kicad_routing_tools._cli:route"
+krt-route-diff = "kicad_routing_tools._cli:route_diff"
+krt-route-planes = "kicad_routing_tools._cli:route_planes"
+krt-bga-fanout = "kicad_routing_tools._cli:bga_fanout"
+krt-check-drc = "kicad_routing_tools._cli:check_drc"
+krt-check-connected = "kicad_routing_tools._cli:check_connected"
+
+[tool.hatch.version]
+path = "VERSION"
+pattern = "(?P<version>\\d+\\.\\d+\\.\\d+\\S*)"
+
+# The wheel is assembled by hatch_build.py: it fetches/builds the Rust
+# grid_router binary and copies the repo tree under kicad_routing_tools/,
+# keeping the layout the scripts' __file__-relative paths expect.
+[tool.hatch.build.targets.wheel]
+packages = ["kicad_routing_tools"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/tests", "/kicad_files", "/docs", "/rust_router/target", "/.github"]
