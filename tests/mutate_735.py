@@ -181,13 +181,13 @@ ROWS = [
 
     # --- the shared predicate ---------------------------------------------
     ('the-predicate-stops-being-raise-only', 'dru',
-     '        if binds and r.clearance_mm > eff:',
-     '        if binds:',
+     '        if rule_binds(r, a_cls, b_cls) and r.clearance_mm > eff:',
+     '        if rule_binds(r, a_cls, b_cls):',
      (T735, TDRU), 'KILLED'),
 
     ('other_only-stops-exempting-siblings', 'dru',
-     '        binds = ((a_in != b_in) or (a_in and b_in and not r.other_only))',
-     '        binds = ((a_in != b_in) or (a_in and b_in))',
+     '    return not class_matches(classes, rule.cls) if rule.other_only else True',
+     '    return True',
      (T735,), 'KILLED'),
 
     ('the-rule-identity-is-not-reported', 'dru',
@@ -211,9 +211,7 @@ ROWS = [
 
     # --- the grader's delegation ------------------------------------------
     ('check_drc-stops-delegating', 'drc',
-     '        return track_pair_clearance(_track_rules, _cls_of.get(net_a, ()),\n'
-     '                                    _cls_of.get(net_b, ()), eff,\n'
-     '                                    coupled=coupled, layer=layer)',
+     '        return _rule_pair_cl(_track_rules, net_a, net_b, eff, True, layer)',
      '        return eff, None',
      (T735, TDRUC), 'KILLED'),
 ]

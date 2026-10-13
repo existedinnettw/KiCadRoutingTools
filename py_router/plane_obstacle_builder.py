@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple, Optional
 import numpy as np
 
 from kicad_parser import PCBData, Pad, Segment
-from routing_config import GridRouteConfig, GridCoord
+from routing_config import GridRouteConfig, GridCoord, prices_one_net
 from routing_utils import iter_pad_blocked_cells, pad_blocked_cells_array, \
     segment_blocked_cells_array, segment_blocked_spans
 from obstacle_map import (point_in_polygon, point_to_polygon_edge_distance,
@@ -405,6 +405,7 @@ def identify_target_pads(
     return target_pads
 
 
+@prices_one_net('exclude_net_id')
 def build_via_obstacle_map(
     pcb_data: PCBData,
     config: GridRouteConfig,
@@ -1118,6 +1119,7 @@ def block_via_position(obstacles: GridObstacleMap, via_x: float, via_y: float,
     block_circle(obstacles, gx, gy, radius_sq, via_mode=True)
 
 
+@prices_one_net('exclude_net_id')
 def build_routing_obstacle_map(
     pcb_data: PCBData,
     config: GridRouteConfig,
