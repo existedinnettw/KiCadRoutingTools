@@ -3113,13 +3113,33 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
                            if n.name})
         except Exception:
             _track_rules = []
+    # Copper-scope class rules (no Type term) ride the same list: they bind
+    # EVERY copper pair, so `_pair_cl` raises with them (pair-exact, after the
+    # #498 layer replacement) and a violation of one grades like any physical
+    # clearance violation -- KiCad reports it as one.
+    _class_rules = [r for r in _track_rules if r.scope == 'copper']
     if not quiet and _track_rules:
         for _n in _track_notes:
             print(f"  .kicad_dru: {_n}")
-        print("Track-to-track clearance rules (.kicad_dru): "
-              + ", ".join(f"'{r.cls}':{r.clearance_mm:g}"
-                          f"{'(other-only)' if r.other_only else ''}"
-                          for r in _track_rules))
+        for _scope, _what in (('track', 'Track-to-track'),
+                              ('copper', 'Net-class (all copper)')):
+            _rs = [r for r in _track_rules if r.scope == _scope]
+            if _rs:
+                print(f"{_what} clearance rules (.kicad_dru): "
+                      + ", ".join(f"'{r.cls}':{r.clearance_mm:g}"
+                                  f"{'(other-only)' if r.other_only else ''}"
+                                  for r in _rs))
+
+    def _rule_pair_cl(rules, net_a: int, net_b: int, eff: float,
+                      track: bool):
+        # The ONE call into the shared binding predicate (#735).
+        return track_pair_clearance(rules, _cls_of.get(net_a, ()),
+                                    _cls_of.get(net_b, ()), eff, track=track)
+
+    def _class_cl(net_a: int, net_b: int, eff: float) -> float:
+        if not _class_rules:
+            return eff
+        return _rule_pair_cl(_class_rules, net_a, net_b, eff, False)[0]
 
     def _track_pair_cl(net_a: int, net_b: int, layer: str):
         """Effective seg-seg clearance for the pair, plus the TrackRule
@@ -3140,8 +3160,7 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
         eff = _pair_cl(net_a, net_b, layer=layer)
         if not _track_rules:
             return eff, None
-        return track_pair_clearance(_track_rules, _cls_of.get(net_a, ()),
-                                    _cls_of.get(net_b, ()), eff)
+        return _rule_pair_cl(_track_rules, net_a, net_b, eff, True)
 
     def _layer_cl(layer: str, eff: float) -> float:
         v = _lcl.get(layer) if _lcl else None
@@ -3171,8 +3190,8 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
         base = clearance if not _ncl_by_id else \
             max(clearance, _ncl_by_id.get(net_a, 0.0), _ncl_by_id.get(net_b, 0.0))
         if layer is not None:
-            return _layer_cl(layer, base)
-        return base
+            return _class_cl(net_a, net_b, _layer_cl(layer, base))
+        return _class_cl(net_a, net_b, base)
 
     # A pad / footprint clearance OVERRIDE replaces the class/rule value,
     # floored at rules.min_clearance (KiCad 10, measured by
@@ -3188,6 +3207,7 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
             eff = _layer_cl(layer, eff)
         else:
             eff = _pads_cl(eff, pad, other_pad)
+        eff = _class_cl(pad.net_id, other_net, eff)
         return _override_clr(eff, _board_min_clr, pad, other_pad)
 
     def _mark_required(v: dict, eff: float) -> dict:

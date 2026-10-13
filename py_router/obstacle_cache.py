@@ -12,7 +12,7 @@ import math
 import numpy as np
 
 from kicad_parser import PCBData
-from routing_config import GridRouteConfig, GridCoord
+from routing_config import GridRouteConfig, GridCoord, prices_one_net
 import routing_defaults as defaults
 from routing_utils import build_layer_map, iter_pad_blocked_cells, \
     pad_blocked_cells_array, segment_blocked_cells_array, segment_blocked_spans, \
@@ -1263,6 +1263,139 @@ def remove_net_obstacles_from_cache(obstacles: GridObstacleMap, cache_data: NetO
         ledger_cell_watch(obstacles, "cache-remove " + _ledger_site(depth=2, frames=3))
 
 
+# ---- copper-scope .kicad_dru class rules: the per-search overlay ----------
+#
+# A rule like "A.NetClass == 'Logic*' && B.NetClass != 'Logic*'" (no Type
+# term) binds every copper pair across the class boundary. The obstacle map is
+# SHARED by every net a call routes, so stamping each obstacle at the widest
+# value any routed net needs (effective_track_clearances' over-approximation)
+# would, on an isolation board routed in one call, price EVERY net at the rule
+# -- measured on a 120-net isolation board: 49 of the first 94 nets failed.
+# Instead each search gets the exact extra keep-out for ITS net: the copper of
+# every net the rule binds against it, re-stamped at the rule value, added for
+# the duration of the search and removed after (ref-counted, so the shared
+# map is untouched when the search returns). Stamps are cached per
+# (net, value, run geometry) and rebuilt only when that net's copper changes.
+
+def _copper_signature(pcb_data) -> Dict[int, Tuple[int, int]]:
+    """{net_id: (item count, geometry hash)} over segments + vias -- one pass,
+    so a search can tell which cached overlay stamps went stale."""
+    sig: Dict[int, list] = {}
+    for s in pcb_data.segments:
+        d = sig.get(s.net_id)
+        if d is None:
+            d = sig[s.net_id] = [0, 0]
+        d[0] += 1
+        d[1] += hash((s.start_x, s.start_y, s.end_x, s.end_y, s.layer,
+                      getattr(s, 'width', 0)))
+    for v in pcb_data.vias:
+        d = sig.get(v.net_id)
+        if d is None:
+            d = sig[v.net_id] = [0, 0]
+        d[0] += 1
+        d[1] += hash((v.x, v.y, getattr(v, 'size', 0), 'via'))
+    return {k: (a, b) for k, (a, b) in sig.items()}
+
+
+def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
+    """The extra keep-outs a search for ``net_id`` needs under the board's
+    copper-scope class rules (``config.class_rules``): for every other net X a
+    rule binds against ``net_id`` above X's own stamp value, X's copper
+    (tracks, vias, pads) priced at the rule value. [] when no rule binds.
+
+    Raise-only and pair-exact, the same value `GridRouteConfig.pair_clearance`
+    returns for the pair. Net 0 is left out (its copper is footprint
+    mechanics -- NPTH holes -- the base map stamps it)."""
+    rules = getattr(config, 'class_rules', None)
+    if not rules or not net_id:
+        return []
+    from dataclasses import replace as _dc_replace
+    from kicad_dru import track_pair_clearance
+    mem = config.class_memberships or {}
+    own = mem.get(net_id, ())
+    need: Dict[int, float] = {}
+    for nid in pcb_data.nets:
+        if not nid or nid == net_id:
+            continue
+        v = track_pair_clearance(rules, own, mem.get(nid, ()), 0.0,
+                                 track=False)[0]
+        if v > config.obstacle_clearance(nid) + 1e-9:
+            need[nid] = v
+    if not need:
+        return []
+    geo = (config.grid_step, tuple(config.layers), config.via_size,
+           config.via_drill, config.track_width, config.clearance,
+           config.net_clearance_floor)
+    cache = getattr(pcb_data, '_copper_rule_overlay_cache', None)
+    if cache is None or cache.get('geo') != geo:
+        cache = {'geo': geo, 'cfg': {}, 'data': {}}
+        pcb_data._copper_rule_overlay_cache = cache
+    sig = _copper_signature(pcb_data)
+    out: List[NetObstacleData] = []
+    for nid, v in need.items():
+        key = (nid, v)
+        s = sig.get(nid, (0, 0))
+        hit = cache['data'].get(key)
+        if hit is None or hit[0] != s:
+            cfg = cache['cfg'].get(v)
+            if cfg is None:
+                # obstacle_clearance(nid) = max(floor, class) -> raising the
+                # floor to v prices nid's copper at max(v, its own value).
+                floor = (config.net_clearance_floor
+                         if config.net_clearance_floor is not None
+                         else config.clearance)
+                cfg = _dc_replace(config, net_clearance_floor=max(floor, v),
+                                  class_rules=[])
+                cache['cfg'][v] = cfg
+            hit = (s, precompute_net_obstacles(pcb_data, nid, cfg))
+            cache['data'][key] = hit
+        out.append(hit[1])
+    # Copper a phase-3 rip-up has stamped into the working map but not yet
+    # committed to pcb_data (plane_pad_tap.push_inflight_copper): the nets it
+    # rips re-route while it is in flight, and must clear it by the rule too.
+    for segs, vias in getattr(pcb_data, '_inflight_copper', None) or ():
+        for nid in {it.net_id for it in list(segs) + list(vias)} & set(need):
+            from dataclasses import replace as _dc_replace2
+            shadow = _dc_replace2(
+                pcb_data, pads_by_net={},
+                segments=[x for x in segs if x.net_id == nid],
+                vias=[x for x in vias if x.net_id == nid])
+            out.append(precompute_net_obstacles(shadow, nid,
+                                                cache['cfg'][need[nid]]))
+    return out
+
+
+_OVERLAY_ACTIVE: Set[Tuple[int, int]] = set()
+
+
+def with_copper_rule_overlay(fn):
+    """Decorator for a search entry ``fn(pcb_data, net_id, config, obstacles,
+    ...)``: stamps `copper_rule_overlay` into ``obstacles`` for the call and
+    removes exactly those stamps on every exit. A no-op (one attribute read)
+    on a board without copper-scope class rules; re-entry for the same map
+    and net (one entry calling another) stamps once."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(pcb_data, net_id, config, obstacles, *args, **kwargs):
+        if not getattr(config, 'class_rules', None):
+            return fn(pcb_data, net_id, config, obstacles, *args, **kwargs)
+        key = (id(obstacles), net_id)
+        if key in _OVERLAY_ACTIVE:
+            return fn(pcb_data, net_id, config, obstacles, *args, **kwargs)
+        added = copper_rule_overlay(pcb_data, net_id, config)
+        for d in added:
+            add_net_obstacles_from_cache(obstacles, d)
+        _OVERLAY_ACTIVE.add(key)
+        try:
+            return fn(pcb_data, net_id, config, obstacles, *args, **kwargs)
+        finally:
+            _OVERLAY_ACTIVE.discard(key)
+            for d in reversed(added):
+                remove_net_obstacles_from_cache(obstacles, d)
+    return wrapped
+
+
 def build_working_obstacle_map(base_obstacles: GridObstacleMap,
                                  net_obstacles_cache: Dict[int, NetObstacleData]) -> GridObstacleMap:
     """Build a working obstacle map with base + all cached net obstacles.
@@ -1354,6 +1487,7 @@ class ViaPlacementObstacleData:
     blocked_cells_by_layer: Dict[str, np.ndarray]
 
 
+@prices_one_net('exclude_net_id')
 def precompute_via_placement_obstacles(
     pcb_data: PCBData,
     net_id: int,

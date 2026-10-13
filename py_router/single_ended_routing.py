@@ -25,6 +25,7 @@ from connectivity import (
     compute_component_mst_edges,
 )
 from obstacle_map import get_same_net_through_hole_positions
+from obstacle_cache import with_copper_rule_overlay
 from bresenham_utils import walk_line
 from geometry_utils import simplify_path
 
@@ -247,6 +248,34 @@ def _custom_pad_min_dist(custom, net_id, pts, base_clearance=None,
     return best
 
 
+def _class_rule_excess(pcb_data, net_id, fnids, base_clearance):
+    """Per-foreign-net excess of the board's copper-scope .kicad_dru class
+    rules (a NetClass pair condition with no Type term) over
+    ``base_clearance``, for the moving net ``net_id``: an array aligned with
+    ``fnids``, or None when no rule is installed on ``pcb_data`` (see
+    kicad_dru.install_track_clearances) or no base is given. Pair-exact --
+    the same value GridRouteConfig.pair_clearance resolves -- so the
+    foreign-distance helpers below fold it like a netclass excess and every
+    caller's unchanged ``dist >= base + w/2`` gate honors the rule."""
+    ctx = getattr(pcb_data, '_class_rule_ctx', None)
+    if not ctx or not base_clearance:
+        return None
+    rules, mem = ctx
+    from kicad_dru import track_pair_clearance
+    own = mem.get(net_id, ())
+    memo = {}
+    out = np.empty(len(fnids), dtype=float)
+    for i, f in enumerate(fnids):
+        f = int(f)
+        v = memo.get(f)
+        if v is None:
+            v = memo[f] = max(0.0, track_pair_clearance(
+                rules, own, mem.get(f, ()), base_clearance,
+                track=False)[0] - base_clearance)
+        out[i] = v
+    return out
+
+
 def _pt_foreign_pad_dist(pcb_data, net_id, x, y, layer, base_clearance=None,
                          net_clearances=None):
     """Min edge distance from point (x,y) on `layer` to any pad of a DIFFERENT net.
@@ -297,6 +326,9 @@ def _pt_foreign_pad_dist(pcb_data, net_id, x, y, layer, base_clearance=None,
             fcls = np.array([max(0.0, net_clearances.get(int(f), base_clearance) - base_clearance)
                              for f in nids[near]], dtype=float)
             excess = np.maximum(excess, fcls)
+        rx = _class_rule_excess(pcb_data, net_id, nids[near], base_clearance)
+        if rx is not None:
+            excess = np.maximum(excess, rx)
         d = d - excess
     return min(float(np.min(d)), best_custom)
 
@@ -339,6 +371,9 @@ def _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
             fcls = np.array([max(0.0, net_clearances.get(int(f), base_clearance) - base_clearance)
                              for f in nids[near]], dtype=float)
             excess = np.maximum(excess, fcls)
+        rx = _class_rule_excess(pcb_data, net_id, nids[near], base_clearance)
+        if rx is not None:
+            excess = np.maximum(excess, rx)
     # Rounded-rect signed distance in each pad's LOCAL frame (query offsets
     # rotated by R(-rot); identity for axis-aligned pads): shrink the
     # half-extents by the corner radius, take the outside distance to that
@@ -561,6 +596,9 @@ def _seg_foreign_seg_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
                                max(_nc.get(int(f), base_clearance),
                                    _tc.get(int(f), 0.0)) - base_clearance)
                            for f in fnid], dtype=float)
+    rx = _class_rule_excess(pcb_data, net_id, nid[near], base_clearance)
+    if rx is not None:
+        excess = rx if excess is None else np.maximum(excess, rx)
     if _SEG_DIST_EXACT:
         # The exact segment-to-segment distance (2026-09-11): the minimum
         # between two segments is attained at an endpoint of one of them
@@ -652,10 +690,15 @@ def _seg_foreign_via_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     else:
         tt = np.clip(((fcx - x1) * dx + (fcy - y1) * dy) / l2, 0.0, 1.0)
         d = np.hypot(fcx - (x1 + tt * dx), fcy - (y1 + tt * dy)) - fr
+    excess = None
     if net_clearances:
         fnid = nids[near]
         excess = np.array([max(0.0, net_clearances.get(int(f), base_clearance) - base_clearance)
                            for f in fnid], dtype=float)
+    rx = _class_rule_excess(pcb_data, net_id, nids[near], base_clearance)
+    if rx is not None:
+        excess = rx if excess is None else np.maximum(excess, rx)
+    if excess is not None:
         d = d - excess
     return float(np.min(d))
 
@@ -1959,6 +2002,7 @@ def _per_net_via_config(config: GridRouteConfig, pcb_data, net_id: int) -> GridR
         return config
 
 
+@with_copper_rule_overlay
 def route_net_with_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
                               obstacles: GridObstacleMap,
                               attraction_path: Optional[List[Tuple[int, int, int]]] = None,
@@ -3962,6 +4006,7 @@ def _draw_at_own_via(vias, pcb_data, net_id: int, config, obstacles) -> None:
                        'multipoint via kept at the run size', count=kept)
 
 
+@with_copper_rule_overlay
 def route_multipoint_main(
     pcb_data: PCBData,
     net_id: int,
@@ -4632,6 +4677,7 @@ def get_all_segment_tap_points(
                    for (gx, gy, layer_idx), (ox, oy) in tap_points.items()])
 
 
+@with_copper_rule_overlay
 def route_multipoint_taps(
     pcb_data: PCBData,
     net_id: int,
