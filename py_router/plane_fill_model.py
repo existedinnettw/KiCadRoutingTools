@@ -337,14 +337,32 @@ class ZoneFillModel:
         # Foreign copper on this layer + every via/through barrel. `guard` is
         # rebound per object to the pairwise clearance and restored after each
         # loop (the closure reads the CURRENT binding).
+        # The .kicad_dru copper-scope class rules (an isolation barrier)
+        # carve the pour too: KiCad's filler keeps the pair's rule clearance.
+        _ctx = getattr(pcb_data, '_class_rule_ctx', None)
+        if _ctx and not env_knobs.NO_FILL_NETCLASS:
+            from kicad_dru import track_pair_clearance as _tpc
+            _rules, _mem = _ctx
+            _own = _mem.get(net_id, ())
+            _rmemo = {}
+
+            def _rule(fnid, g):
+                r = _rmemo.get(fnid)
+                if r is None:
+                    r = _rmemo[fnid] = _tpc(_rules, _own, _mem.get(fnid, ()),
+                                            0.0, track=False)[0]
+                return r if r > g else g
+        else:
+            def _rule(fnid, g):
+                return g
         for v in pcb_data.vias:
             if v.net_id != net_id:
-                guard = max(guard_base, _nc.get(v.net_id, 0.0))
+                guard = _rule(v.net_id, max(guard_base, _nc.get(v.net_id, 0.0)))
                 _stamp_disc(v.x, v.y, v.size / 2.0)
         guard = guard_base
         for s in pcb_data.segments:
             if s.net_id != net_id and s.layer == layer:
-                guard = max(guard_base, _nc.get(s.net_id, 0.0))
+                guard = _rule(s.net_id, max(guard_base, _nc.get(s.net_id, 0.0)))
                 _stamp_seg(s)
         guard = guard_base
         from kicad_parser import pad_joins_zone
@@ -367,9 +385,9 @@ class ZoneFillModel:
                     # its hole_clearance rule) honors it, so stamp this pad at
                     # max(zc, class pair, override). The closure guard is
                     # rebound for the stamps below and restored after the loop.
-                    guard = max(guard_base,
-                                _nc.get(p.net_id, 0.0),
-                                getattr(p, 'local_clearance', 0.0) or 0.0)
+                    guard = _rule(p.net_id, max(
+                        guard_base, _nc.get(p.net_id, 0.0),
+                        getattr(p, 'local_clearance', 0.0) or 0.0))
                 if p.pad_type == 'np_thru_hole':
                     _stamp_disc(p.global_x, p.global_y, (p.drill or 0) / 2.0)
                     continue

@@ -40,6 +40,22 @@ A track rule binds tracks and nothing else: no pad, no via, no zone. That is
 KiCad's own ``Type=='track'`` and it is why the pad channels above are
 untouched by this half of the module.
 
+THE THIRD SHAPE rides the same parse and the same TrackRule: a net-class pair
+condition with NO Type term (``A.NetClass == 'Logic*' && B.NetClass !=
+'Logic*'``, an isolation barrier), ``scope='copper'``. KiCad applies it to
+every copper pair -- tracks, vias, pads -- so it is raise-only like the track
+channel but must NOT go through ``effective_track_clearances``: with both
+sides of the barrier routed in one call that over-approximation stamps EVERY
+net at the rule value. It is priced pair-exact instead:
+``track_pair_clearance`` (graders; ``track=False`` for non-track pairs),
+``GridRouteConfig.pair_clearance`` (router verdicts), the per-search keep-out
+overlay ``obstacle_cache.copper_rule_overlay`` (the single-ended A* map),
+``GridRouteConfig.routing_net`` (the plane engines' fresh per-net maps), and
+``pcb_data._class_rule_ctx`` (the post-route foreign-distance gates and the
+plane fill model), all installed by ``install_track_clearances``.
+NetClass compares follow KiCad: wildcard ``*`` / ``?``, case-insensitive, a
+net in no class is ``Default``.
+
 HISTORICAL NOTE -- the `#549` label, and why this module no longer carries it.
 
 Commits dated 2026-08-02 label four unrelated topics `#549 A-1`, `#549 A-2`,
@@ -67,6 +83,7 @@ PR #555). Retagging them would have removed the one accurate pointer.
 
 import os
 import re
+from functools import lru_cache
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 # value with unit suffix; KiCad writes e.g. 0.3mm / 12mil / 0.012in
@@ -83,11 +100,24 @@ _NOT_COUPLED = re.compile(r"!\s*AB\s*\.\s*isCoupledDiffPair\s*\(\s*\)")
 
 
 class TrackRule(NamedTuple):
-    """A track-to-track clearance rule scoped to one net class (#735).
+    """A net-class clearance rule (#735), raise-only over the resolved pair.
 
-    ``other_only`` is True for the ``A.NetClass=='C' && B.NetClass!='C'``
-    shape: the requirement binds only member-vs-NON-member pairs, so a
-    member's own siblings (the coupled half of a diff pair) are exempt.
+    ``cls`` is the A-side pattern (KiCad wildcards ``*`` / ``?``). ``other_only``
+    is True for the ``A.NetClass=='C' && B.NetClass!='C'`` shape: the
+    requirement binds only member-vs-NON-member pairs, so a member's own
+    siblings (the coupled half of a diff pair) are exempt.
+
+    ``other`` is the B-side test, ``(op, pattern)``, for a pair whose B side
+    names a DIFFERENT pattern (``A.NetClass=='P' && B.NetClass=='Q'`` or
+    ``... B.NetClass!='Q'``); None keeps the single-class reading above.
+
+    ``scope`` is ``'track'`` for a rule that also carries
+    ``A.Type=='track' && B.Type=='track'`` (binds tracks only) and
+    ``'copper'`` for one with no Type term, which KiCad applies to EVERY
+    copper pair: tracks, vias, pads. Only the track scope feeds the shared
+    per-obstacle map (`effective_track_clearances`); a copper rule is priced
+    pair-exactly (`GridRouteConfig.pair_clearance`, check_drc's `_pair_cl`,
+    and the router's per-search overlay `obstacle_cache.copper_rule_overlay`).
 
     ``except_coupled`` is True when the condition also ANDs in
     ``!AB.isCoupledDiffPair()`` (#1295): a pair whose two nets KiCad's
@@ -101,12 +131,86 @@ class TrackRule(NamedTuple):
     clearance_mm: float
     except_coupled: bool = False
     layer_clause: Optional[str] = None
+    scope: str = 'track'
+    other: Optional[Tuple[str, str]] = None
 
 
-def _parse_track_condition(expr: str) -> Optional[Tuple[str, bool, bool]]:
-    """(class, other_only, except_coupled) when ``expr`` is exactly the
-    honored track-pair subset; None otherwise (the rule falls back to the
-    skip note)."""
+@lru_cache(maxsize=None)
+def _wildcard(pattern: str):
+    """KiCad's expression-string ``==``: a wildcard compare (``*``, ``?``),
+    case-insensitive (``WildCompareString(..., false)``)."""
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c)
+                 for c in pattern)
+    return re.compile(rx + r"\Z", re.IGNORECASE | re.DOTALL)
+
+
+def class_matches(classes, pattern: str) -> bool:
+    """True when a net whose class memberships are ``classes`` satisfies
+    ``NetClass == pattern``. A net in no class is KiCad's ``Default`` (net-0
+    copper included: an orphan item gets the default net class)."""
+    m = _wildcard(pattern).match
+    return any(m(c) for c in (classes or ('Default',)))
+
+
+def _side_a(rule: TrackRule, classes) -> bool:
+    """The rule's anchoring ``NetClass == cls`` side."""
+    return class_matches(classes, rule.cls)
+
+
+def _side_b(rule: TrackRule, classes) -> bool:
+    """The rule's other side: ``other`` when it names a pattern, else
+    "not in cls" for other_only, else anything."""
+    if rule.other is not None:
+        op, pat = rule.other
+        return class_matches(classes, pat) == (op == '==')
+    return not class_matches(classes, rule.cls) if rule.other_only else True
+
+
+def rule_binds(rule: TrackRule, a_cls, b_cls) -> bool:
+    """Does ``rule`` bind the pair of nets with memberships a_cls / b_cls?
+    KiCad tries a rule with A and B both ways round, so this is symmetric."""
+    return ((_side_a(rule, a_cls) and _side_b(rule, b_cls))
+            or (_side_a(rule, b_cls) and _side_b(rule, a_cls)))
+
+
+def _parse_class_terms(ncs):
+    """(cls, other_only, other) for the NetClass terms of a no-Type rule, or
+    None outside the honored pair subset: at most one term per side, at least
+    one ``==`` (an all-``!=`` rule has no class to anchor on)."""
+    terms = {}
+    for s, op, c in ncs:
+        if s.upper() in terms:
+            return None
+        terms[s.upper()] = (op, c)
+    eq = [s for s, (op, _c) in terms.items() if op == '==']
+    if not eq:
+        return None
+    side = 'A' if 'A' in eq else eq[0]
+    cls = terms[side][1]
+    rest = [t for s, t in terms.items() if s != side]
+    if not rest:
+        return cls, False, None
+    op, other = rest[0]
+    if op == '!=' and other == cls:
+        return cls, True, None      # the single-class mirror: other_only
+    return cls, False, (op, other)
+
+
+def _parse_track_condition(expr: str):
+    """(class, other_only, scope, other, except_coupled) when ``expr`` is in the honored
+    net-class subset; None otherwise (the rule falls back to the skip note).
+
+    Two shapes, NetClass terms joined by ``&&`` only:
+      * ``A.Type=='track' && B.Type=='track'`` plus exactly one ``==`` term
+        (optionally its ``!=`` mirror on the other side): scope 'track',
+        the #735 subset, unchanged;
+      * no Type term, at most one NetClass term per side, at least one
+        ``==`` (``A.NetClass == 'Logic*' && B.NetClass != 'Logic*'``):
+        scope 'copper', binding every copper item of the pair.
+
+    Either shape may also AND in ``!AB.isCoupledDiffPair()`` once (#1295),
+    which sets ``except_coupled``.
+    """
     except_coupled = len(_NOT_COUPLED.findall(expr))
     if except_coupled > 1:
         return None
@@ -115,7 +219,13 @@ def _parse_track_condition(expr: str) -> Optional[Tuple[str, bool, bool]]:
     ncs = _NC_TERM.findall(expr)
     residue = _NC_TERM.sub("", _TRACK_TYPE.sub("", expr))
     residue = residue.replace("&&", "").strip()
-    if residue or types != {'A', 'B'} or not ncs:
+    if residue or not ncs:
+        return None
+    if not types:
+        got = _parse_class_terms(ncs)
+        return (None if got is None
+                else (got[0], got[1], 'copper', got[2], bool(except_coupled)))
+    if types != {'A', 'B'}:
         return None
     eq = [(s.upper(), c) for s, op, c in ncs if op == '==']
     ne = [(s.upper(), c) for s, op, c in ncs if op == '!=']
@@ -126,8 +236,8 @@ def _parse_track_condition(expr: str) -> Optional[Tuple[str, bool, bool]]:
         oside, ocls = ne[0]
         if oside == side or ocls != cls:
             return None
-        return cls, True, bool(except_coupled)
-    return cls, False, bool(except_coupled)
+        return cls, True, 'track', None, bool(except_coupled)
+    return cls, False, 'track', None, bool(except_coupled)
 
 
 def track_rule_on_layer(rule: TrackRule, layer: Optional[str]) -> bool:
@@ -319,16 +429,26 @@ def _parse_dru(text: str, copper_layers: List[str]
                  or layer_clause.endswith('.Cu'))))
         track = (_parse_track_condition(condition)
                  if condition and copper_clause else None)
+        if track is not None and track[2] == 'copper' and has_layer_clause:
+            track = None  # the copper-scope channel prices every layer
         if track is not None:
-            cls, other_only, except_coupled = track
+            cls, other_only, scope, other, except_coupled = track
             track_rules.append(TrackRule(str(name), cls, other_only, clearance_mm,
-                                         except_coupled, layer_clause))
-            notes.append(f"rule '{name}': track-to-track clearance "
-                         f"{clearance_mm}mm for class '{cls}'"
-                         f"{' vs other classes only' if other_only else ''}"
-                         f"{', its own coupled partner exempt' if except_coupled else ''}"
-                         f"{f' on {layer_clause}' if layer_clause else ''}"
-                         f" -- handled by the track channel")
+                                         except_coupled, layer_clause,
+                                         scope=scope, other=other))
+            vs = (f" vs class {'' if other[0] == '==' else 'not '}'{other[1]}'"
+                  if other else ' vs other classes only' if other_only else '')
+            vs += (f"{', its own coupled partner exempt' if except_coupled else ''}"
+                   f"{f' on {layer_clause}' if layer_clause else ''}")
+            if scope == 'track':
+                notes.append(f"rule '{name}': track-to-track clearance "
+                             f"{clearance_mm}mm for class '{cls}'{vs}"
+                             f" -- handled by the track channel")
+            else:
+                notes.append(f"rule '{name}': copper clearance "
+                             f"{clearance_mm}mm for class '{cls}'{vs}"
+                             f" (tracks, vias, pads) -- handled by the "
+                             f"class-pair channel")
             continue
         layers = _rule_layers(node, copper_layers, notes)
         if layers is None:
@@ -654,7 +774,7 @@ def unbound_length_rules(rules: List[LengthRule], net_names: Dict[int, str],
 
 def track_pair_clearance(track_rules: List[TrackRule], a_cls, b_cls,
                          resolved: float, *, coupled: bool = False,
-                         layer: Optional[str] = None
+                         layer: Optional[str] = None, track: bool = True
                          ) -> Tuple[float, Optional[TrackRule]]:
     """THE pair-exact track-rule resolver: (effective mm, the rule that RAISED
     it or None).
@@ -679,18 +799,23 @@ def track_pair_clearance(track_rules: List[TrackRule], a_cls, b_cls,
     The rule identity comes back because check_drc's violation record uses it
     to tell a structural, rule-governed pair from a physical graze; a caller
     that only needs the number takes ``[0]``.
+
+    ``track=True`` (a track-vs-track pair) consults every rule: a copper-scope
+    rule binds tracks too. ``track=False`` is any other copper pair (via, pad)
+    and consults only the copper-scope rules -- KiCad's ``Type=='track'``
+    keeps a track rule off them.
     """
     eff, rule = resolved, None
     if not track_rules:
         return eff, rule
     for r in track_rules:
+        if not track and r.scope != 'copper':
+            continue
         if r.except_coupled and coupled:
             continue
         if r.layer_clause is not None and not track_rule_on_layer(r, layer):
             continue
-        a_in, b_in = r.cls in a_cls, r.cls in b_cls
-        binds = ((a_in != b_in) or (a_in and b_in and not r.other_only))
-        if binds and r.clearance_mm > eff:
+        if rule_binds(r, a_cls, b_cls) and r.clearance_mm > eff:
             eff = r.clearance_mm
             rule = r
     return eff, rule
@@ -769,20 +894,29 @@ def effective_track_clearances(track_rules: List[TrackRule],
     raised for the partner as well; the P<->N pricing sites read the exact
     value from ``config.track_partner_clearances`` instead. A rule's layer
     clause is not read here either: one value per net prices it on every
-    layer. Both over-block, neither under-blocks."""
+    layer. Both over-block, neither under-blocks.
+
+    Track-scope rules only. A copper-scope rule would put that same
+    over-approximation on every pad and via stamp as well, which on an
+    isolation board (one class against everything else, both routed in one
+    call) prices EVERY net at the rule value; those rules are priced
+    pair-exactly instead (see TrackRule).
+
+    General form (pair rules with a distinct B-side pattern): eff[nid] applies
+    when nid passes one side of the rule and some routed net passes the
+    other. For the single-class shapes this is exactly the case list above."""
+    track_rules = [r for r in (track_rules or ()) if r.scope == 'track']
     if not track_rules:
         return {}
-    routed = set(routed_net_ids or ())
+    routed = list(routed_net_ids or ())
     eff: Dict[int, float] = {}
     for rule in track_rules:
-        members = {nid for nid, cls in memberships.items() if rule.cls in cls}
-        routed_has_member = bool(routed & members)
-        routed_has_nonmember = bool(routed - members)
+        routed_has_a = any(_side_a(rule, memberships.get(r, ())) for r in routed)
+        routed_has_b = any(_side_b(rule, memberships.get(r, ())) for r in routed)
         for nid in all_net_ids:
-            in_c = nid in members
-            applies = ((in_c and (routed_has_nonmember
-                                  or (not rule.other_only and routed_has_member)))
-                       or (not in_c and routed_has_member))
+            c = memberships.get(nid, ())
+            applies = ((_side_a(rule, c) and routed_has_b)
+                       or (_side_b(rule, c) and routed_has_a))
             if applies and rule.clearance_mm > eff.get(nid, 0.0):
                 eff[nid] = rule.clearance_mm
     return eff
@@ -796,11 +930,17 @@ def install_track_clearances(config, track_clearances, input_file,
     """Resolve and install the track-to-track clearance map on ``config``,
     engine-side so BOTH fronts inherit it (like install_layer_clearances: no
     flag, no GUI control -- the .kicad_dru is the single source of truth). An
-    explicit {net_id: mm} dict (tests) wins and stops the auto-read; None ->
-    read the sibling .kicad_dru, resolve class memberships through
-    list_nets.net_class_memberships (the SAME resolver the netclass clearance
-    map uses), and compute the effective per-obstacle map for this call's
-    routed set. Announces what is honored, once per (board, rules).
+    explicit {net_id: mm} dict (tests) wins and stops the auto-read of the
+    track map; None -> read the sibling .kicad_dru, resolve class memberships
+    through list_nets.net_class_memberships (the SAME resolver the netclass
+    clearance map uses), and compute the effective per-obstacle map for this
+    call's routed set. Announces what is honored, once per (board, rules).
+
+    The copper-scope class rules of the same file (no Type term) install
+    beside it as ``config.class_rules`` / ``config.class_memberships``,
+    whichever way the track map was given: they are pair-exact and do not
+    depend on the routed set, so a sub-run that forwards its parent's track
+    map (the final reconciliation) still reads them from the board.
 
     #1295: with a "keep pairs apart" rule, ``config.track_partner_clearances``
     ({frozenset({P, N}): mm}) carries the pair-exact track-rule value of each
@@ -809,44 +949,79 @@ def install_track_clearances(config, track_clearances, input_file,
     explicit-dict path, whose map a parent resolved (a nested sub-run then
     prices P<->N at that map, over-requiring)."""
     config.track_partner_clearances = {}
-    if track_clearances is not None:
-        config.track_clearances = dict(track_clearances)
-        return
+    config.class_rules = []
+    config.class_memberships = {}
     if not input_file:
         input_file = getattr(pcb_data, 'source_path', "") or ""
-    if not input_file or pcb_data is None:
+    rules, notes = ((read_board_track_clearances(input_file)
+                     if input_file and pcb_data is not None else ([], [])))
+    copper = [r for r in rules if r.scope == 'copper']
+    memberships = None
+    if rules:
+        from list_nets import net_class_memberships
+        nets = {nid: n.name for nid, n in pcb_data.nets.items() if n.name}
+        memberships = net_class_memberships(input_file, nets)
+    if copper:
+        config.class_rules = copper
+        config.class_memberships = {nid: frozenset(c)
+                                    for nid, c in memberships.items()}
+    elif not rules and getattr(pcb_data, '_class_rule_ctx', None):
+        # A nested engine handed the parent's in-memory board but a path
+        # with no rules file next to it (the plane finalize and the final
+        # reconciliation run against the OUTPUT path, whose .kicad_dru is
+        # copied only after the run): keep the rules the parent installed on
+        # this very board -- its memberships are keyed by these net ids.
+        config.class_rules, config.class_memberships = pcb_data._class_rule_ctx
+        copper = config.class_rules
+    if pcb_data is not None:
+        # The foreign-distance gates (single_ended_routing._class_rule_excess:
+        # smoothing, necking, rescue, connectors) take pcb_data, not config.
+        pcb_data._class_rule_ctx = ((config.class_rules,
+                                     config.class_memberships)
+                                    if copper else None)
+    if track_clearances is not None:
+        config.track_clearances = dict(track_clearances)
+        eff = config.track_clearances
+    elif not any(r.scope == 'track' for r in rules):
         config.track_clearances = {}
-        return
-    rules, notes = read_board_track_clearances(input_file)
+        eff = {}
+    else:
+        eff = effective_track_clearances(rules, memberships, nets.keys(),
+                                         routed_net_ids or nets.keys())
+        config.track_clearances = eff
+        trk = [r for r in rules if r.scope == 'track']
+        if any(r.except_coupled for r in trk):
+            config.track_partner_clearances = {
+                frozenset((p, n)): track_pair_clearance(
+                    trk, memberships.get(p, ()), memberships.get(n, ()), 0.0,
+                    coupled=True)[0]
+                for p, n in coupled_net_pairs(nets) if p in eff or n in eff}
     if not rules:
-        config.track_clearances = {}
         return
-    from list_nets import net_class_memberships
-    nets = {nid: n.name for nid, n in pcb_data.nets.items() if n.name}
-    memberships = net_class_memberships(input_file, nets)
-    eff = effective_track_clearances(rules, memberships, nets.keys(),
-                                     routed_net_ids or nets.keys())
-    config.track_clearances = eff
-    if any(r.except_coupled for r in rules):
-        config.track_partner_clearances = {
-            frozenset((p, n)): track_pair_clearance(
-                rules, memberships.get(p, ()), memberships.get(n, ()), 0.0,
-                coupled=True)[0]
-            for p, n in coupled_net_pairs(nets) if p in eff or n in eff}
     _key = (os.path.abspath(input_file),
             tuple(sorted((r.name, r.cls, r.other_only, r.clearance_mm,
-                          r.except_coupled, r.layer_clause or '')
-                         for r in rules)))
+                          r.except_coupled, r.layer_clause or '',
+                          r.scope, r.other or ('', '')) for r in rules)))
     if _key not in _TRACK_ANNOUNCED:
         _TRACK_ANNOUNCED.add(_key)
         for r in rules:
-            print(f"Track-to-track clearance rule from the board's .kicad_dru "
-                  f"(raise-only on seg-seg pairs): '{r.name}' class "
-                  f"'{r.cls}' {r.clearance_mm:g}mm"
-                  f"{' (vs other classes only)' if r.other_only else ''}"
-                  f"{' (its own coupled partner exempt)' if r.except_coupled else ''}"
-                  f"{f' (on {r.layer_clause}; the router prices it on every layer)' if r.layer_clause else ''}"
-                  f" -- {len(eff)} net(s) priced")
+            vs = (f" (vs class {'' if r.other[0] == '==' else 'not '}"
+                  f"'{r.other[1]}')" if r.other
+                  else ' (vs other classes only)' if r.other_only else '')
+            vs += (f"{' (its own coupled partner exempt)' if r.except_coupled else ''}"
+                   f"{f' (on {r.layer_clause}; the router prices it on every layer)' if r.layer_clause else ''}")
+            if r.scope == 'track':
+                print(f"Track-to-track clearance rule from the board's "
+                      f".kicad_dru (raise-only on seg-seg pairs): '{r.name}' "
+                      f"class '{r.cls}' {r.clearance_mm:g}mm{vs}"
+                      f" -- {len(eff)} net(s) priced")
+            else:
+                n_in = sum(1 for c in config.class_memberships.values()
+                           if class_matches(c, r.cls))
+                print(f"Net-class clearance rule from the board's .kicad_dru "
+                      f"(raise-only, pair-exact, tracks/vias/pads): "
+                      f"'{r.name}' class '{r.cls}' {r.clearance_mm:g}mm{vs}"
+                      f" -- {n_in} net(s) in '{r.cls}'")
 
 
 _ANNOUNCED = set()  # (board path, map items) already printed this process
