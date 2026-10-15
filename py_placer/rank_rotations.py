@@ -20,9 +20,10 @@ part went unseated, or was written at another angle, is a hard fail and ranks
 last. Next come the angles where a seed's re-seat could not put the part back
 (`reseat_declined`, #1117): the polish walked it out because that paid, so
 they rank after every angle whose seeds held it, but they still rank. The rest
-rank by (unseated, probe failures when probed, crossings, hpwl,
-grade errors) over the seeds' medians; a tie goes to the earlier angle in the
-ladder, the input angle when it is ranked. Any other seed that fails its
+rank by (unseated, probe failures when probed -- then the probe's vias and
+copper, #1191 -- crossings, hpwl, grade errors) over the seeds' medians; a
+tie goes to the earlier angle in the ladder, the input angle when it is
+ranked. Any other seed that fails its
 intent gate is NOT a tier (on a pile most do, for repairable reasons), but
 every angle reports how many of its seeds did, and the winner line says so. --probe
 routes the top --probe-top rotations full-board (converge.probe_route), and a
@@ -56,8 +57,8 @@ import os
 import statistics
 import sys
 
-from compare_seeds import (_split_forwarded, probe_full, probe_nets,
-                           run_place_seed)
+from compare_seeds import (_split_forwarded, decap_only, probe_full,
+                           probe_nets, probe_order, run_place_seed)
 
 #: Flags --seed-args may not carry: the ranker sets them itself, or they
 #: would make an arm something other than a polished seed from this pile.
@@ -222,7 +223,7 @@ def eligible_refs(pcb, intent, blocks, pcb_file, *, min_pads=16,
     one with fewer than `min_pads` connected pads."""
     from placement import floorplan
     from placement.part_class import classify_part
-    from placement.placement_state import assess_placement
+    from placement.placement_state import SEED_STACKED, assess_placement
     refs_all = sorted(pcb.footprints)
     must = {r for p in intent.must_lock for r in refs_all if fnmatch.fnmatchcase(r, p)}
     edge = {str(c['ref']) for c in intent.edge_claims()}
@@ -230,8 +231,9 @@ def eligible_refs(pcb, intent, blocks, pcb_file, *, min_pads=16,
     declared = floorplan.rotations_for_ref(intent, blocks)
     outside = set()
     st = assess_placement(pcb, pcb_file)
-    if (st.partially_unplaced and not st.unplaced
-            and '--force' not in seed_args):
+    # place_seed's own scope (#1165: `seed_scope`, so a pile whose fixed
+    # parts were placed first is not scoped to a stack among them).
+    if st.seed_scope == SEED_STACKED and '--force' not in seed_args:
         outside = set(refs_all) - set(st.stacked_suspect_refs)
     hard: dict = {}
     soft: dict = {}
@@ -274,6 +276,11 @@ def aggregate(rot, rows, ladder_index):
     fails = [(r.get('probe') or {}).get('failures') for r in rows]
     probed = any(f is not None for f in fails)
 
+    def _probe(key):
+        # #1191: over the seeds that HAVE a verdict, like the failures
+        return _median([(r.get('probe') or {}).get(key) for r in rows
+                        if (r.get('probe') or {}).get('failures') is not None])
+
     def _spread(key):
         vals = {r['seed']: r.get(key) for r in rows}
         got = [v for v in vals.values() if v is not None]
@@ -286,6 +293,8 @@ def aggregate(rot, rows, ladder_index):
             'unseated_max': max((r.get('unseated') or 0) for r in rows),
             'probed': probed,
             'probe_failures': _median(fails) if probed else None,
+            'probe_vias': _probe('vias') if probed else None,
+            'probe_copper_mm': _probe('copper_mm') if probed else None,
             'crossings': _spread('crossings'), 'hpwl': _spread('hpwl'),
             'grade_errors': _spread('grade_errors')}
 
@@ -294,18 +303,29 @@ def rotation_key(agg):
     """Lower is better: hard fails last, then fewer seeds whose re-seat
     declined the part at this angle (#1117), then fewer unseated parts, then a
     probe verdict (a probed rotation before an unprobed one, fewer failures
-    first), then crossings, hpwl and grade errors (medians over the seeds),
-    then the ladder order, which puts the input rotation first on a tie."""
+    first, then -- #1191 -- fewer probe vias, then less probe copper, each a
+    median over the seeds), then crossings, hpwl and grade errors (medians
+    over the seeds), then the ladder order, which puts the input rotation
+    first on a tie. Unprobed, the probe terms are 0 and crossings decide.
+
+    The vias term is #1191: on sonde_xilinx six probed arms all routed (0
+    failures) and the ranking fell through to crossings, 180 (17) over 270
+    (31), while the probe's own vias were 3 vs 1 -- and in a 10-seed sweep
+    crossings did not predict vias (28 crossings / 12 vias, 29 / 3, 45 / 1).
+    Once blocking ties, CLAUDE.md breaks the tie on vias then copper."""
     big = float('inf')
 
     def _m(key):
-        v = agg[key]['median'] if isinstance(agg[key], dict) else agg[key]
+        v = agg.get(key)
+        v = v['median'] if isinstance(v, dict) else v
         return big if v is None else v
     return (agg['hard_fail'] is not None,
             agg.get('declined_seeds', 0),
             agg['unseated_max'],
             0 if agg['probed'] else 1,
             agg['probe_failures'] if agg['probed'] else 0,
+            _m('probe_vias') if agg['probed'] else 0,
+            _m('probe_copper_mm') if agg['probed'] else 0,
             _m('crossings'),
             _m('hpwl'),
             _m('grade_errors'),
@@ -347,8 +367,8 @@ def _best_seed_row(rows):
 
     def _k(r):
         f = (r.get('probe') or {}).get('failures')
-        return (f is None, f if f is not None else 0, r.get('crossings'),
-                r.get('hpwl'), r['seed'])
+        return ((f is None,) + probe_order(r.get('probe'))
+                + (r.get('crossings'), r.get('hpwl'), r['seed']))
     return min(ok, key=_k)
 
 
@@ -606,6 +626,9 @@ def main():
                'place_seed_rc': r.returncode,
                'gated': r.returncode == 4,
                'grade_errors': s.get('grade_errors'),
+               'grade_error_rules': s.get('grade_error_rules'),
+               # #1191: gated by decap rules alone -- --repair-decaps' job
+               'decap_only': r.returncode == 4 and decap_only(s),
                'unseated': s.get('unseated'),
                'unseated_refs': s.get('unseated_refs') or [],
                'rotation_unseated': s.get('rotation_unseated') or {},
@@ -662,13 +685,16 @@ def main():
     doc['ranking'] = [a['rotation'] for a in ranked]
 
     print(f"\n{'rotation':>8}  {'rank':>4}  {'crossings':>9}  {'hpwl':>9}  "
-          f"{'unseated':>8}  {'errors':>6}  {'probe':>5}  hard fail")
+          f"{'unseated':>8}  {'errors':>6}  {'probe':>5}  {'vias':>5}  "
+          f"{'copper_mm':>9}  hard fail")
     for a in ranked:
         print(f"{a['rotation']:>8g}  {a['rank']:>4}  "
               f"{str(a['crossings']['median']):>9}  "
               f"{str(a['hpwl']['median']):>9}  {a['unseated_max']:>8}  "
               f"{str(a['grade_errors']['median']):>6}  "
               f"{str(a['probe_failures'] if a['probed'] else '-'):>5}  "
+              f"{str(a.get('probe_vias') if a['probed'] else '-'):>5}  "
+              f"{str(a.get('probe_copper_mm') if a['probed'] else '-'):>9}  "
               f"{a['hard_fail'] or ''}")
 
     winner = ranked[0] if ranked and ranked[0]['hard_fail'] is None else None
@@ -698,7 +724,9 @@ def main():
     doc['best'] = {'rotation': winner['rotation'], 'seed': best_row['seed'],
                    'board': best_row['board'],
                    'crossings': winner['crossings']['median'],
-                   'hpwl': winner['hpwl']['median']}
+                   'hpwl': winner['hpwl']['median'],
+                   'probe_vias': winner.get('probe_vias'),
+                   'probe_copper_mm': winner.get('probe_copper_mm')}
     doc['best']['gated_seeds'] = winner['gated_seeds']
     doc['best']['grade_errors'] = winner['grade_errors']['median']
     ctl = doc['control']
@@ -715,13 +743,21 @@ def main():
                  if set(ctl['baseline_seeds']) == {c['seed'] for c in ctl['rows']}
                  else ""))
              if ctl['unseated_seeds'] else "")
-          + (f", probe failures {winner['probe_failures']}"
+          + (f", probe failures {winner['probe_failures']}, vias "
+             f"{winner.get('probe_vias')}, copper "
+             f"{winner.get('probe_copper_mm')} mm"
              if winner['probed'] else ''))
     if winner['gated_seeds']:
+        # #1191: a decap-only gate needs --repair-decaps; bare --repair
+        # reports a decap violator unresolved and does not move it
+        _gated = [r for r in by_rot[winner['rotation']] if r.get('gated')]
+        _how = ('place_seed --repair --repair-decaps'
+                if _gated and all(r.get('decap_only') for r in _gated)
+                else 'place_seed --repair')
         print(f"  its seed fails its intent gate on {winner['gated_seeds']} "
               f"of {len(args.seeds)} seed(s) (grade errors "
               f"{winner['grade_errors']['median']}): repair it "
-              f"(place_seed --repair) or weigh the next angle")
+              f"({_how}) or weigh the next angle")
     if len(args.seeds) == 1:
         print("  one seed: the margin has no spread to compare against; add "
               "--seeds 0 1 2 to see one")

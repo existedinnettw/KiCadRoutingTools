@@ -102,7 +102,13 @@ class BriefError(fp.IntentError):
 
 _TOP_LEVEL_KEYS = {'schema', 'kind', 'board', 'units', 'min_reader',
                    'product', 'interfaces', 'keepouts', 'fixed', 'unknown',
-                   'proximity', 'context', 'arrays'}
+                   'proximity', 'context', 'arrays', 'assembly'}
+#: #1255. What the board's ASSEMBLER requires that the board file cannot say.
+#: `body_edge_mm` (mm, or "unknown") compiles to the intent's
+#: `assembly.body_edge_mm`, which arms check_assembly's `body_edge_band`
+#: gate; `why` and `requirement` ride into its `context`. `sides` is not
+#: here: the emitter OBSERVES it off the board.
+_ASSEMBLY_KEYS = {'body_edge_mm', 'why', 'requirement', 'note', 'context'}
 
 #: Keys refused BY NAME, with the reason, rather than as merely unknown.
 _REFUSED_TOP_LEVEL = {
@@ -225,6 +231,9 @@ class Brief:
     source_path: str = ''
     #: #1051. Declared rows. Defaulted, like `proximity`.
     arrays: Tuple[Dict[str, object], ...] = ()
+    #: #1255. The assembler's requirements (`body_edge_mm`). Defaulted, like
+    #: `proximity`, so a brief declaring none compiles exactly as before.
+    assembly: Dict[str, object] = field(default_factory=dict)
 
 
 def empty_brief(board: str = '') -> Brief:
@@ -760,6 +769,22 @@ def _brief_from_dict(raw: Dict, source_path: str = '') -> Brief:
 
     arrays = _array_rows(raw, interfaces, set(posed))
 
+    # #1255. The assembler's body-to-edge distance. "unknown" is first-class,
+    # as everywhere in this file: the author looked and has no answer yet.
+    assembly = fp._obj(raw.get('assembly'), 'assembly')
+    fp._reject_unknown(assembly, _ASSEMBLY_KEYS, 'assembly')
+    fp._entry_context(assembly, 'assembly')
+    bem = assembly.get('body_edge_mm')
+    if bem is not None and bem != UNKNOWN:
+        if fp._number(bem, 'assembly.body_edge_mm') <= 0:
+            raise BriefError(
+                f"assembly.body_edge_mm: {bem!r} is not a distance -- write "
+                f"{UNKNOWN!r} if the assembler's rule is not known")
+    if assembly and bem is None:
+        raise BriefError(
+            "assembly: declares no `body_edge_mm`, so it constrains nothing. "
+            "Give it a distance in mm (or \"unknown\"), or drop the key")
+
     unknown = fp._str_tuple(raw.get('unknown'), 'unknown')
     return Brief(schema=SCHEMA_VERSION, kind=KIND,
                  board=str(raw.get('board') or ''), units=units,
@@ -767,7 +792,8 @@ def _brief_from_dict(raw: Dict, source_path: str = '') -> Brief:
                  keepouts=tuple(keepouts), fixed=tuple(fixed),
                  unknown=unknown, proximity=tuple(proximity),
                  context=fp._obj(raw.get('context'), 'context'),
-                 source_path=source_path, arrays=tuple(arrays))
+                 source_path=source_path, arrays=tuple(arrays),
+                 assembly=dict(assembly))
 
 
 def _fixed_pose(f: Dict, where: str, interface_refs) -> None:
@@ -1107,7 +1133,27 @@ def compile_brief(brief: Brief, *, board_refs: Sequence[str] = (),
             unmatched.append(ref)
         fposes.append(row)
 
+    # #1255. The assembler's body-to-edge distance compiles to the intent's
+    # `assembly.body_edge_mm`, which arms check_assembly's `body_edge_band`
+    # gate. Its prose rides in `assembly.context.body_edge_mm`, apart from
+    # the emitted `sides` observation the same block carries.
+    asm: Dict[str, object] = {}
+    bem = brief.assembly.get('body_edge_mm')
+    if bem == UNKNOWN:
+        unknown.append('assembly.body_edge_mm')
+    elif bem is not None:
+        declared.append('assembly.body_edge_mm')
+        actx: Dict[str, object] = dict(brief.assembly.get('context') or {})
+        for key in ('why', 'requirement', 'note'):
+            if brief.assembly.get(key):
+                actx[key] = brief.assembly[key]
+        actx['source'] = 'brief'
+        asm = {'body_edge_mm': float(bem),
+               'context': {'body_edge_mm': actx}}
+
     fragment: Dict[str, object] = {}
+    if asm:
+        fragment['assembly'] = asm
     if conns:
         fragment['edge_connectors'] = conns
     if keeps:
@@ -1135,6 +1181,9 @@ def compile_brief(brief: Brief, *, board_refs: Sequence[str] = (),
     if arrs or fposes:
         # #1051/#1054: reader 7 introduced both keys.
         need_reader = max(need_reader, 7)
+    if asm:
+        # #1255: reader 9 introduced `assembly.body_edge_mm`.
+        need_reader = max(need_reader, 9)
     if need_reader:
         fragment['min_reader'] = need_reader
 
@@ -1612,6 +1661,17 @@ def merge_into_intent(emitted: Dict, fragment: Dict, report: Dict) -> Dict:
     for key in ('arrays', 'fixed_poses'):
         if fragment.get(key):
             out[key] = list(emitted.get(key) or []) + list(fragment[key])
+    # #1255. Merged INTO the emitted block, which carries the observed
+    # `sides`: the brief states the assembler's band and nothing else there.
+    if fragment.get('assembly'):
+        fa = fragment['assembly']
+        asm = dict(emitted.get('assembly') or {})
+        actx = dict(asm.get('context') or {})
+        actx.update(fa.get('context') or {})
+        asm.update({k: v for k, v in fa.items() if k != 'context'})
+        if actx:
+            asm['context'] = actx
+        out['assembly'] = asm
     if fragment.get('min_reader'):
         # A MAX here too, and for the same reason it is one inside the
         # fragment: an emitted document that already declares a reader must not
@@ -1648,6 +1708,8 @@ def merge_into_intent(emitted: Dict, fragment: Dict, report: Dict) -> Dict:
                 own = cb.get(key) or (cb.get('overhang_mm.min')
                                       if key == 'overhang_mm' else None)
                 bmap[f"edge_connectors[{c['ref']}].{key}"] = own or 'declared'
+    if 'body_edge_mm' in (fragment.get('assembly') or {}):
+        bmap['assembly.body_edge_mm'] = 'declared'
     if bmap:
         ctx['basis'] = bmap
     if fragment.get('keepouts'):
@@ -1867,6 +1929,25 @@ def drift_pairs(intent_doc: Dict, fragment: Dict) -> List[Tuple[str, str]]:
                             f"{ref}.pose.{field_name}: brief says "
                             f"{f.get(field_name)!r}, the intent "
                             f"{cur.get(field_name)!r}"))
+    # #1255. One number, compared as a number -- and a band the intent
+    # carries FROM the brief, which the brief no longer declares, drifts
+    # too: check_assembly would keep gating on it.
+    fa = fragment.get('assembly') or {}
+    ia = intent_doc.get('assembly') or {}
+    cur = ia.get('body_edge_mm')
+    if 'body_edge_mm' in fa:
+        if (cur is None or isinstance(cur, bool)
+                or not isinstance(cur, (int, float))
+                or abs(float(cur) - float(fa['body_edge_mm'])) > 1e-9):
+            out.append(('assembly.body_edge_mm',
+                        f"assembly.body_edge_mm: brief says "
+                        f"{fa['body_edge_mm']!r}, the intent "
+                        f"{'says ' + repr(cur) if cur is not None else 'does not declare it'}"))
+    elif cur is not None and (((ia.get('context') or {}).get(
+            'body_edge_mm') or {}).get('source') == 'brief'):
+        out.append(('assembly.body_edge_mm',
+                    f"assembly.body_edge_mm: the intent carries {cur!r} "
+                    f"from the brief, which no longer declares it"))
     return out
 
 
@@ -1897,7 +1978,17 @@ _CLAUSE_RULE = {'interfaces': 'edge_connector',
                 'proximity': 'proximity',
                 'arrays': 'array_formation',
                 'fixed': 'fixed_pose',
-                'product': None}
+                'product': None,
+                # #1255: graded by check_assembly --intent (`body_edge_band`),
+                # which this floorplan grade does not run.
+                'assembly': None}
+
+#: #1255. Clauses another INSTRUMENT grades, by clause id. The floorplan
+#: grade carries them -- no rule of its own measures them -- and says where
+#: they are graded, so "carried" is not read as "checked by nothing".
+GRADED_ELSEWHERE = {
+    'assembly.body_edge_mm': 'check_assembly --intent, body_edge_band',
+}
 
 #: Interface keys that are CARRIED and graded by nothing, by design. They are
 #: already in `report['not_graded']`; naming them here too keeps the coverage
@@ -1905,7 +1996,7 @@ _CLAUSE_RULE = {'interfaces': 'edge_connector',
 _CLAUSE_CARRIED = {'mount_mode', 'cable_entry', 'cable_envelope_mm'}
 
 _CLAUSE_RE = re.compile(
-    r'^(?P<kind>interfaces|keepouts|proximity|arrays|fixed|product)'
+    r'^(?P<kind>interfaces|keepouts|proximity|arrays|fixed|product|assembly)'
     r'(?:\[(?P<inner>.*)\])?'
     r'(?:\.(?P<key>[a-z_]+))?$')
 
@@ -1929,7 +2020,7 @@ def parse_clause_id(cid: str) -> Optional[Dict[str, object]]:
     kind, inner, key = m.group('kind'), m.group('inner'), m.group('key')
     out: Dict[str, object] = {'kind': kind, 'ref': inner, 'near': None,
                               'key': key, 'row': None}
-    if kind == 'product':
+    if kind in ('product', 'assembly'):
         out['ref'] = None
         return out
     if inner is None:
@@ -2015,6 +2106,15 @@ def _clause_state(rec, intent_doc, rules_run, abstained, cons=None):
                  and _intent_has(intent_doc, r.get('compiled_to'))]
         if sides and 'edge_connector' in rules_run:
             return 'graded', '', 'edge_connector'
+    if kind == 'assembly':
+        # #1255: the clause IS graded, by another instrument. Carried here
+        # (it never blocks this grade's coverage), and the row says where.
+        if 'body_edge_mm' not in (intent_doc.get('assembly') or {}):
+            return ('uncovered', "the intent's assembly block does not "
+                                 "carry body_edge_mm", None)
+        return ('carried', f"graded by "
+                           f"{GRADED_ELSEWHERE['assembly.body_edge_mm']}, "
+                           f"not by the floorplan grade", None)
     if rule is None:
         return 'carried', '', rule
     if kind == 'interfaces' and key == 'user_facing':

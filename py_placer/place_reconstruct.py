@@ -185,8 +185,8 @@ Examples:
         return UNPLACED_EXIT
     st = assess_placement(pcb, args.input_file)
     if st.has_copper:
-        print(f"place_reconstruct: board carries {st.segments} segment(s) / "
-              f"{st.vias} via(s); reconstruction moves footprints and would "
+        print(f"place_reconstruct: board carries {st.copper_carried}; "
+              f"reconstruction moves footprints and would "
               f"strand them. Strip or re-run from the unrouted board.",
               file=sys.stderr)
         return UNPLACED_EXIT

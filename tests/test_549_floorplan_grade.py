@@ -47,7 +47,10 @@ KF = os.path.join(ROOT, 'kicad_files')
 # ulx3s is the workhorse: 234 parts, 168 on the back, 10 sheet blocks.
 ULX = os.path.join(KF, 'ulx3s.kicad_pcb')
 ROUND_TRIP = ['splitflap_driver', 'interf_u_unrouted', 'tigard', 'watchy',
-              'ulx3s', 'glasgow_revC', 'sonde_u']
+              'ulx3s', 'glasgow_revC', 'sonde_u',
+              # #1174: rp2350 J1 (USB-C, north) overhangs its block's zone;
+              # coldfire: its three DSUBs become edge claims with #1176.
+              'rp2350_fpga_eensy_prePlane', 'kit-dev-coldfire-xilinx_5213']
 SOURCES = ('kicad', 'sheet')
 
 

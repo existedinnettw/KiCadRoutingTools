@@ -195,8 +195,8 @@ ROWS = [
      "            rec['basis'] = ('check_assembly' if True else",
      (T1151,), 'KILLED'),
     ('one-part-on-a-marker-is-a-stack', 'pstate',
-     "            if sum(1 for r in refs",
-     "            if sum(1 for r in refs + ['__marker__']",
+     "    if sum(1 for r in sus if not markers[r]) >= 2:",
+     "    if sum(1 for r in sus if not markers[r]) >= 1:",
      (T1151,), 'KILLED'),
     # ---- the second phase-3 verifier's cases ------------------------------
     ('an-off-board-part-is-pending', 'seed',

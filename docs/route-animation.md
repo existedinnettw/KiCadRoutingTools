@@ -993,8 +993,8 @@ pile beside the board and a board standing on its edge mid-flip, so every
 ordinary frame drew the board at about a third of its box. The fit is a
 pure function of the state, so renders stay byte-identical;
 `tests/test_1081_e2e.py` holds the last frame's board to at least 60 % of
-its box on the binding axis. Pours (built from the zone OUTLINE, which may
-run past the board) and a glide's halo and ghost never set the fit.
+its box on the binding axis. Pours (the zone OUTLINE, clipped to the board)
+and a glide's halo and ghost never set the fit.
 
 **Parts** are always a body box plus their pads, read from the board itself, in
 each part's own frame, so a part that turns while it glides (#1086) turns in 3D
@@ -1010,7 +1010,9 @@ pointed at its `.step` twin, and the status line counts the matches
 
 **Plane pours, pad outlines and drills (#1090).** Each zone's outline is on
 the 3D board from the frame its net's fill is revealed, as the 2D film draws
-it; a custom pad is its real outline (not the parser's board-space bbox); and
+it: clipped to the board, less its cutouts (#1205), because KiCad clips the
+fill and a pour drawn past a notched board otherwise covers the notch; a
+custom pad is its real outline (not the parser's board-space bbox); and
 every drill is drawn at its own centre (an offset drill is not the copper's).
 
 **Rendering is all-or-nothing.** Every distinct state is rendered to disk

@@ -15,12 +15,14 @@ signed position is positive outside the board, `overhang = max(0, signed)` and
 simulation, and it takes no margin at all.
 
 WHAT COUNTS AS A BODY. A closed convex polygonal envelope on the footprint's
-own Fab layer -- or its own SilkS layer when it draws nothing on Fab; an
-unusable Fab drawing does NOT fall back to SilkS -- drawn with `fp_line`, sharp-cornered
+own Fab layer -- or its own SilkS layer when it draws nothing on Fab, or
+when its Fab drawing is a marking by `body.fab_cannot_be_body` (#1243); any
+other unusable Fab drawing does NOT fall back to SilkS -- drawn with `fp_line`, sharp-cornered
 `fp_rect` and straight-sided `fp_poly`. Internal markings drawn with those
 primitives are allowed, but every side of the convex hull must actually be
 drawn. ANY other primitive on that layer makes the whole body UNMEASURED --
-`fp_arc`, `fp_circle` (a pin-1 dot included), `fp_curve`, a rounded
+`fp_arc`, `fp_circle` (a pin-1 dot included, unless the guard above reads
+the SilkS instead), `fp_curve`, a rounded
 `fp_rect`, an `fp_poly` carrying an arc -- as do open outlines, concave
 envelopes and a part that draws no body. Text, pads and courtyards are never
 body geometry. Vertices are transformed before taking extrema, so any
@@ -109,11 +111,13 @@ def _envelope(segments):
     return hull
 
 
-def _parse_body(block, side):
+def _parse_body(block, side, fab_is_marking=False):
     """`(hull, layer, reason)` for one footprint block on side 'F' or 'B'.
 
     A saved B-side footprint already stores mirrored local coordinates, so
-    the side only selects WHICH layer is the part's own."""
+    the side only selects WHICH layer is the part's own. `fab_is_marking`
+    (#1243): the caller found the Fab drawing to be a marking by
+    `body.fab_cannot_be_body`, so the SilkS layer is read instead."""
     if block is None:
         return None, None, 'footprint block not found in the board file'
     layers = {}
@@ -127,6 +131,11 @@ def _parse_body(block, side):
             layers.setdefault(lm.group(1), []).append((kind, item))
     layer = next((side + suffix for suffix in ('.Fab', '.SilkS')
                   if side + suffix in layers), None)
+    if fab_is_marking and layer == side + '.Fab':
+        layer = side + '.SilkS'
+        if layer not in layers:
+            return None, side + '.Fab', ('the Fab drawing is a marking, not '
+                                         'a body, and no SilkS is drawn')
     if layer is None:
         return None, None, 'no body drawing on the footprint face'
     try:
@@ -183,10 +192,11 @@ class _BoardSource:
                 'outline without cutouts, curves or extra cuts')
         self.blocks = dict(_footprint_blocks(text))
 
-    def envelope(self, ref, side):
-        key = (ref, side)
+    def envelope(self, ref, side, fab_is_marking=False):
+        key = (ref, side, fab_is_marking)
         if key not in self.envelopes:
-            self.envelopes[key] = _parse_body(self.blocks.get(ref), side)
+            self.envelopes[key] = _parse_body(self.blocks.get(ref), side,
+                                              fab_is_marking)
         return self.envelopes[key]
 
 
@@ -231,6 +241,21 @@ class ConnectorGeometry:
         self.boundary_reason = self.source.boundary_reason
         self._encloses = {}
         self._pad_boxes = {}
+        self._bodies = None
+
+    def _fab_is_marking(self, ref):
+        """Is the part's Fab drawing a marking, not a body (#1243)?
+
+        The decision is the body model's own (`BodyGeometry.fab_rejected`,
+        i.e. `body.fab_cannot_be_body` against its pad bbox), so this reader
+        and the facing grade, which reads the silk body when the guard
+        fires, agree on the same part. Built once, on first need."""
+        if self._bodies is None:
+            from .body import board_bodies
+            self._bodies = (board_bodies(self.pcb, self.path)
+                            if self.path else {})
+        geom = self._bodies.get(ref)
+        return bool(geom is not None and geom.fab_rejected)
 
     def _encloses_own_pads(self, ref, fp, points):
         """Does the envelope enclose the centroid of the part's own pads?
@@ -275,6 +300,9 @@ class ConnectorGeometry:
             return None, None, 'part not on this board'
         from .legality import footprint_side
         points, layer, reason = self.source.envelope(ref, footprint_side(fp))
+        side = footprint_side(fp)
+        if layer == side + '.Fab' and self._fab_is_marking(ref):
+            points, layer, reason = self.source.envelope(ref, side, True)
         if points is None:
             return None, layer, reason
         if not self._encloses_own_pads(ref, fp, points):

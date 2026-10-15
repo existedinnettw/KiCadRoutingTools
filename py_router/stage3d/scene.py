@@ -139,6 +139,34 @@ def _not_assembled(pcb) -> set:
             & {'board_only', 'exclude_from_pos_files'}}
 
 
+def _clip_pours(pours, outline, cutouts) -> list:
+    """Each pour cut to the board: the outline ring less its cutouts (#1205).
+
+    KiCad clips a pour's FILL to the board, so a zone drawn as a rectangle
+    past it is the usual habit, and its raw outline covered a notched board's
+    notch and ears -- in the 2D film and on this 3D board alike. A pour the
+    board splits becomes one entry per piece; `holes` carries the cutouts
+    that land inside a piece (the page cuts them, as it does the board's)."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    board = Polygon(outline).buffer(0)
+    if cutouts:
+        board = board.difference(unary_union([Polygon(c).buffer(0)
+                                               for c in cutouts]))
+    out = []
+    for p in pours:
+        g = Polygon(p['poly']).buffer(0).intersection(board)
+        for piece in getattr(g, 'geoms', [g]):
+            if piece.geom_type != 'Polygon' or piece.is_empty:
+                continue
+            out.append({'net': p['net'], 'layer': p['layer'],
+                        'poly': [[float(x), float(y)]
+                                 for x, y in piece.exterior.coords[:-1]],
+                        'holes': [[[float(x), float(y)] for x, y in r.coords[:-1]]
+                                  for r in piece.interiors]})
+    return out
+
+
 def build_scene(pcb) -> dict:
     """The static scene from the film's FINAL board."""
     bi = pcb.board_info
@@ -163,12 +191,14 @@ def build_scene(pcb) -> dict:
         parts[ref] = g
     # #1090: the plane pours, each shown from the frame its net's fill is
     # revealed (the film's `revealed_zones`, per frame in the timeline).
-    # Like the 2D film, the zone OUTLINE -- not the computed fill.
+    # Like the 2D film, the zone OUTLINE -- not the computed fill -- clipped
+    # to the board this scene draws (#1205).
     li = {n: i for i, n in enumerate(bi.copper_layers)}
-    pours = [{'net': int(z.net_id), 'layer': li[z.layer],
-              'poly': [[float(x), float(y)] for x, y in z.polygon]}
-             for z in (getattr(pcb, 'zones', None) or [])
-             if z.layer in li and len(z.polygon) >= 3]
+    pours = _clip_pours([{'net': int(z.net_id), 'layer': li[z.layer],
+                          'poly': [[float(x), float(y)] for x, y in z.polygon]}
+                         for z in (getattr(pcb, 'zones', None) or [])
+                         if z.layer in li and len(z.polygon) >= 3],
+                        outline, cutouts)
     return {'bounds': [float(v) for v in bb], 'outline': outline,
             'cutouts': cutouts, 'thickness': board_thickness(pcb),
             'layers': list(bi.copper_layers), 'parts': parts, 'glb': None,

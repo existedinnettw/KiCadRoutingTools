@@ -142,6 +142,9 @@
  "seeder.py::_courtyard_overlap": {
   "grade_rect": 2
  },
+ "seeder.py::_depth_order": {
+  "grade_rect": 1
+ },
  "seeder.py::_dispose_unseated": {
   "rect": 4
  },
@@ -171,6 +174,9 @@
  },
  "seeder.py::_overlap_at": {
   "rect": 2
+ },
+ "seeder.py::_packed_starts": {
+  "grade_rect": 1
  },
  "seeder.py::_row_extent": {
   "rect": 1

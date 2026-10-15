@@ -435,7 +435,10 @@ def preexisting_blocker_hint(blocked_cells, config, pcb_data, net_id,
     from contextlib import redirect_stdout
     from plane_blocker_detection import find_route_blocker_from_frontier
     protected = set(routed_net_ids) | {net_id, 0}
-    protected |= {z.net_id for z in (getattr(pcb_data, 'zones', None) or [])}
+    from kicad_parser import pour_zones
+    # Plane nets are never named as blockers; a teardropped signal net is not
+    # one (#1164).
+    protected |= {z.net_id for z in pour_zones(getattr(pcb_data, 'zones', None))}
 
     # Attribute NEAR-ENDPOINT cells first: the decisive blockers of a boxed-in
     # pad are the couple of stubs at the corridor mouth, while a whole-frontier

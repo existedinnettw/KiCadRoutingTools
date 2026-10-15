@@ -436,6 +436,8 @@ def test_json_out_writes_a_file_with_instrument_and_checklist():
         # one. Re-stated rather than relaxed to a subset, because a subset
         # check is what would have let the drift through in the first place.
         assert set(cl) == {'a_off_outline',
+                           # #1255: each body's distance to the board edge.
+                           'a_body_edge_band',
                            'b_pad_clearance_pairs',
                            'b_body_overlap_pairs',
                            # #896: the tightest drawn-body seam and the
@@ -446,6 +448,8 @@ def test_json_out_writes_a_file_with_instrument_and_checklist():
                            'b_courtyard_census_error',
                            'b_courtyard_overlap_mm2',
                            'b_cross_side_stacks',
+                           # #1250: a test point under another part's body.
+                           'b_testpoint_covered',
                            'c_hole_conflicts', 'c_locked_refs', 'd_moved'}, (
             f'checklist keys moved to {sorted(cl)}')
         assert cl['d_moved'] == {'moved': 22, 'expected': 22, 'match': True}

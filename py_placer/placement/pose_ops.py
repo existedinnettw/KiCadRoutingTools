@@ -482,6 +482,53 @@ def new_pairs(before: Dict, after: Dict, pair_key: str) -> List[str]:
             if tuple(p[:2]) not in had]
 
 
+#: The pair list that names the parts behind a count arm, so a refused snap
+#: candidate is reported by WHO it hit, not only by which tally moved (#1209).
+PAIR_OF = {'pad_conflicts': 'pad_conflict_pairs',
+           'hole_conflicts': 'hole_conflict_pairs',
+           'pad_stack_count': 'pad_stack_pairs'}
+
+
+def regrade_refusal(before: Dict, after: Dict, bad: List[str],
+                    strict: bool) -> Dict[str, List[str]]:
+    """`{category: ["A/B", ...]}`: why ONE re-graded snap candidate was refused.
+
+    `bad` is `worsened(before, after)`. A pair arm whose count arm also moved
+    is folded into the count arm's entry, so a hole conflict reads once, as
+    `hole_conflicts: [Module301/SW501]`, not twice. With `bad` empty the
+    candidate was refused by `--strict-legal` alone, and the categories are
+    the ones still dirty at that pose (inherited damage included: the strict
+    arm is absolute), marked as such.
+    """
+    out: Dict[str, List[str]] = {}
+    if bad:
+        for k in bad:
+            if k in PAIR_KEYS and any(PAIR_OF.get(c) == k for c in bad):
+                continue
+            pk = PAIR_OF.get(k) or (k if k in PAIR_KEYS else None)
+            out[k] = new_pairs(before, after, pk) if pk else []
+        return out
+    if not strict:
+        return out
+    for k in LEGALITY_KEYS:
+        if after.get(k):
+            pk = PAIR_OF.get(k)
+            out[k + ' (--strict-legal)'] = (
+                ['%s/%s' % (p[0], p[1]) for p in (after.get(pk) or ())]
+                if pk else [])
+    for k in MAGNITUDE_KEYS:
+        if (after.get(k) or 0.0) > MAGNITUDE_EPS:
+            out[k + ' (--strict-legal)'] = []
+    # The two non-numeric arms of `is_clean`.
+    for dirty, label in (
+            (after.get('pad_edge', {}).get('complete') is False,
+             'pad_edge incomplete'),
+            (bool(after.get('mating_keepout_error')), 'mating_keepout_error')):
+        if dirty:
+            out[label + ' (--strict-legal)'] = []
+    return out
+
+
 def is_clean(report: Dict) -> bool:
     """Is this board legal in the ABSOLUTE sense, not merely no worse?"""
     return not (report.get('pad_edge', {}).get('complete') is False
@@ -621,8 +668,19 @@ def snap_candidates(board_path: str, ref: str, *, rot: float, clearance: float,
     # refusal. The caller's "stay near" is honoured in the second phase, which
     # only considers lattice poses NEARER than the ranked answer.
     ordered = out + lattice
+    # The ranker's nearest pose the radius bound dropped (#1209), so a snap
+    # that refuses can say "--radius N would reach a pose" -- the honest
+    # advice to a call that already snapped -- instead of offering the pose
+    # back as something to "try with --snap". Never re-graded here.
+    beyond = min((p for p in ranked
+                  if (p.get('dist_mm') or 0.0) > radius + 1e-9),
+                 key=lambda p: (p.get('dist_mm') or 0.0), default=None)
     census = {'ranked': len(out),
               'ranked_before_radius': len(ranked),
+              'nearest_beyond_radius': (
+                  None if beyond is None else
+                  {'x': beyond['x'], 'y': beyond['y'], 'rot': beyond['rot'],
+                   'dist_mm': beyond.get('dist_mm')}),
               'lattice': len(lattice),
               'radius_mm': radius,
               'step_mm': step,
@@ -829,6 +887,7 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
         after = grade(cand_pcb, cand, clearance, board_edge_clearance,
                       declared_keepouts)
         bad = worsened(before, after)
+        snap_ran = False
 
         if snap and len(placements) != 1:
             # SAID, not silently dropped: --snap/--near relocates ONE part,
@@ -869,12 +928,19 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                 summary['output'] = None
                 raise PoseRefusal(exc.reason, code=exc.code, ref=ref,
                                   summary=summary) from exc
-            summary['nearest_legal'] = next(
-                (p for p in poses if p['rung'] == 'ranked'), None)
-            summary['nearest_legal_basis'] = (
-                'pose_score.rank_poses / QuenchState.candidate_valid -- an '
-                'AABB gate, RE-GRADED here before it is written')
+            snap_ran = True
+            # #1209: nothing is named here yet. This used to store the first
+            # RANKED candidate before any re-grade, and when every candidate
+            # then failed, the refusal offered that very pose back -- the
+            # requested one, 0.000 mm away -- as something to "try with
+            # --snap", to a call that had just snapped. A snap names only
+            # what its own re-grade passed (set below), or nothing.
             summary['snap_census'] = census
+            # WHY each re-graded candidate was refused: {category: candidates}
+            # and {category: {pair: candidates}}, so a refusal can say what
+            # the census found instead of only "no".
+            refused_by: Dict[str, int] = {}
+            refused_pairs: Dict[str, Dict[str, int]] = {}
 
             def _grade_pose(cp):
                 """Write one candidate onto the staging board and grade it."""
@@ -885,7 +951,15 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                 pcb_c = parse_kicad_pcb(cand)
                 g = grade(pcb_c, cand, clearance, board_edge_clearance,
                           declared_keepouts)
-                return trial, pcb_c, g, worsened(before, g)
+                b = worsened(before, g)
+                if b or (strict and not is_clean(g)):
+                    for k, pairs in regrade_refusal(before, g, b,
+                                                    strict).items():
+                        refused_by[k] = refused_by.get(k, 0) + 1
+                        bucket = refused_pairs.setdefault(k, {})
+                        for pr in pairs:
+                            bucket[pr] = bucket.get(pr, 0) + 1
+                return trial, pcb_c, g, b
 
             # TWO PHASES, each with its OWN budget, and the reason is the
             # measured behaviour of the two rungs rather than tidiness:
@@ -925,6 +999,12 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
 
             if chosen is not None:
                 cand_pose, placements, cand_pcb, after, bad = chosen
+                # The one pose this snap may name: its own re-grade passed it.
+                summary['nearest_legal'] = cand_pose
+                summary['nearest_legal_basis'] = (
+                    'the snapped pose: ranked by pose_score.rank_poses '
+                    '(rung ranked) or taken from the lattice (rung lattice), '
+                    'then RE-GRADED here and passed before it was written')
                 # RE-STAGE the winner. Phase 2 may have graded other poses
                 # after it, so the staging file holds the LAST candidate
                 # tried, not the chosen one -- and the staging file is what
@@ -955,6 +1035,19 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                 # THEIR request rather than the last thing tried.
                 # `candidates_tried` against `ranked + lattice` is how a reader
                 # tells "there was nothing" from "we stopped looking".
+                summary['nearest_legal_basis'] = (
+                    'none: --snap re-graded every candidate it tried and '
+                    'refused each one (snap_census.regrade_refused_by), and '
+                    'a pose its own re-grade refused is not offered back '
+                    '(#1209)')
+                summary['snap_census']['regrade_refused_by'] = dict(
+                    sorted(refused_by.items(), key=lambda kv: (-kv[1], kv[0])))
+                summary['snap_census']['regrade_refused_pairs'] = {
+                    k: dict(sorted(v.items(), key=lambda kv: (-kv[1], kv[0])))
+                    for k, v in sorted(refused_pairs.items()) if v}
+                summary['snap_census']['untried'] = max(
+                    0, census['ranked'] + census['lattice'] - tried)
+                summary['snap_census']['snap_tries'] = snap_tries
                 write_placed_output(board_path, cand, placements)
                 copy_siblings(board_path, cand)
                 cand_pcb = parse_kicad_pcb(cand)
@@ -1074,10 +1167,14 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                 summary['forced'] = True
 
         if bad or (strict and not summary['legal']):
-            if summary['nearest_legal'] is None and len(placements) == 1:
+            if (summary['nearest_legal'] is None and len(placements) == 1
+                    and not snap_ran):
                 # Name the alternative even when the caller did not ask to
                 # snap: a refusal that only says no costs the caller another
-                # round trip to find out what WOULD have worked.
+                # round trip to find out what WOULD have worked. NOT on a call
+                # that snapped (#1209): its own census is the answer there,
+                # and an unverified ranker pose "to try with --snap" is advice
+                # it has already taken.
                 try:
                     poses, _d = nearest_legal(
                         cand, placements[0]['reference'], clearance=clearance,
@@ -1379,6 +1476,12 @@ def _refusal_reason(bad, strict, before, after, summary) -> str:
                   "this pose (%s)" % ', '.join(
                       '%s %s' % (k, after.get(k)) for k in LEGALITY_KEYS
                       if after.get(k)))
+    sc = summary.get('snap_census') or {}
+    if 'candidates_tried' in sc and not summary.get('snapped'):
+        # #1209: this call SNAPPED and nothing passed. Its own census is the
+        # finding; a pose it refused is never offered back, and `--snap` is
+        # never advised to a call that already carries it.
+        return reason + _snap_census_sentence(sc)
     nl = summary.get('nearest_legal')
     if nl and not bad:
         # --strict-legal is a WHOLE-BOARD condition, and this candidate is
@@ -1404,3 +1507,57 @@ def _refusal_reason(bad, strict, before, after, summary) -> str:
                        summary['snap_census'].get('dropped_by') or {})
                    + ".")
     return reason
+
+
+def _snap_census_sentence(sc: Dict) -> str:
+    """What a snap that refused EVERY candidate found, for the refusal (#1209).
+
+    The categories and pairs that refused the re-graded candidates, then the
+    two levers that could still change the answer -- untried candidates
+    (`--snap-tries`) and a ranked pose past the bound (`--radius`) -- each
+    named only when it exists.
+    """
+    tried = sc.get('candidates_tried') or 0
+    radius = sc.get('radius_mm') or 0.0
+    by = sc.get('regrade_refused_by') or {}
+    pairs = sc.get('regrade_refused_pairs') or {}
+
+    def _named(k):
+        names = list(pairs.get(k) or ())
+        if not names:
+            return ''
+        more = len(names) - 4
+        return ' (%s%s)' % (', '.join(names[:4]),
+                            ', +%d more' % more if more > 0 else '')
+
+    if tried:
+        out = (" --snap re-graded %d candidate(s) within %g mm (of %d ranked "
+               "+ %d lattice poses in reach) and refused every one: %s."
+               % (tried, radius, sc.get('ranked') or 0, sc.get('lattice') or 0,
+                  ', '.join('%s x%d%s' % (k, n, _named(k))
+                            for k, n in list(by.items())[:6])
+                  or 'no category recorded'))
+    else:
+        out = (" --snap had no candidate to re-grade within %g mm (%d ranked "
+               "+ %d lattice poses in reach)."
+               % (radius, sc.get('ranked') or 0, sc.get('lattice') or 0))
+    untried = sc.get('untried') or 0
+    if untried:
+        out += (" %d pose(s) in reach were NOT re-graded (--snap-tries %s per "
+                "rung): raise --snap-tries before reading this as 'nothing "
+                "fits'." % (untried, sc.get('snap_tries')))
+    nb = sc.get('nearest_beyond_radius')
+    if nb:
+        reach = math.ceil((nb.get('dist_mm') or 0.0) * 100.0 - 1e-6) / 100.0
+        out += (" The pose ranker's nearest pose past the bound is x=%g y=%g "
+                "rot=%g (%.3f mm away), not re-graded: --radius %g would let "
+                "the snap try it." % (nb['x'], nb['y'], nb['rot'],
+                                      nb.get('dist_mm') or 0.0, reach))
+    if sc.get('dropped_in_place') and not sc.get('ranked_before_radius'):
+        import pose_score
+        out += (" The ranker kept no pose at all, and its census shows the "
+                "knobs veto the part's own spot too -- check the resolved "
+                "clearance against the board's floor before reading this as "
+                "'the part is stuck'. Vetoed by "
+                + pose_score.veto_phrase(sc.get('dropped_by') or {}) + ".")
+    return out

@@ -175,6 +175,11 @@ function buildPours(scene, tl, colors, root) {
   const n = tl.layers.length, d = scene.thickness;
   for (const z of (scene.pours || [])) {
     const shape = new THREE.Shape(z.poly.map(p => new THREE.Vector2(p[0], p[1])));
+    // #1205: the scene clips each pour to the board; a cutout inside one
+    // arrives as a hole, cut as the board's own are
+    for (const ring of (z.holes || [])) {
+      shape.holes.push(new THREE.Path(ring.map(p => new THREE.Vector2(p[0], p[1]))));
+    }
     const g = new THREE.ShapeGeometry(shape);
     g.rotateX(Math.PI / 2);                     // shape (x, y) -> three (x, z)
     const li = z.layer;
@@ -186,8 +191,8 @@ function buildPours(scene, tl, colors, root) {
     m.renderOrder = 1;
     m.visible = false;
     m.userData.net = z.net;
-    // a zone OUTLINE may run far past the board (KiCad clips the fill), so
-    // it never sets the camera's fit
+    // a pour never sets the camera's fit (the scene clips it to the board
+    // since #1205, so the board's own fit already covers it)
     m.userData.noFit = true;
     root.add(m);
     S.pours.push(m);

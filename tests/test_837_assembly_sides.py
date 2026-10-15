@@ -516,9 +516,10 @@ def main():
     # integration, so a red here reads as a green suite.
     # 6 since #959 (#1000), which added `edge_connectors[].side`; 7 since
     # #1051/#1052/#1054 (`arrays[]`, `fixed_poses[]`, `blocks[].rigid`); 8
-    # since #1142 (`decaps.within_radius_refs`, `decaps.within_radius_mm`).
+    # since #1142 (`decaps.within_radius_refs`, `decaps.within_radius_mm`);
+    # 9 since #1255 (`assembly.body_edge_mm`).
     check("reader version names the field it learned",
-          fp.READER_VERSION == 8, fp.READER_VERSION)
+          fp.READER_VERSION == 9, fp.READER_VERSION)
 
     check("graded every fixture", graded == len(EXPECT), f"{graded}")
     print(f"\n{'FAIL' if FAILURES else 'PASS'}: #837 census over {graded} "

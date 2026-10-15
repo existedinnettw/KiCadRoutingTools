@@ -24,7 +24,12 @@ report-only -- healthy human boards ship such pairs by design (measured:
 Exit codes: 0 = clean, 2 = usage/load error, 4 = a blocking pair OR copper
 landing on a KiCad-locked part (see LOCKED-PART CONTACT) OR a coincident-
 origin stack (see COINCIDENT ORIGINS) OR a containment OR a moved-vs-
-baseline courtyard interpenetration (see COURTYARD BLOCKING).
+baseline courtyard interpenetration (see COURTYARD BLOCKING) OR a test point
+a moved member left under another part's body (see TEST POINT COVERED,
+#1250; armed by --baseline like the courtyard gate) OR a body inside the
+body-to-edge band the --intent DECLARES (`assembly.body_edge_mm`; see
+BODY-TO-EDGE BAND, #1255 -- undeclared, it reports against JLCPCB's 2.5 mm
+and never gates).
 """
 
 #: #937 registry: which door(s) show this tool, and whether it changes
@@ -38,15 +43,26 @@ import json
 import os
 import sys
 
+#: #1201. Why a contained pair does not gate, as check_assembly prints it --
+#: keyed by `BodyOverlapPair.gate_exempt`.
+_GATE_EXEMPT_WHY = {
+    'marker_class': 'a mount-hole/fiducial/testpoint is involved',
+    'container_class': 'a board-sized container is involved',
+    'intent_declared': "named in the intent's overlap_waivers",
+    'silk_drawn': 'a silk-drawn body, which never gates (#896)',
+}
+
 
 def main():
     p = argparse.ArgumentParser(
         description="Assembly (body-overlap) audit of a placed board.")
     p.add_argument("board")
     p.add_argument("--intent", default=None, metavar="JSON",
-                   help="Floorplan intent; its overlap_waivers are read, and "
+                   help="Floorplan intent; its overlap_waivers are read, "
                         "a keep-out it names `mating:<ref>` replaces the "
-                        "plug mating region derived from the board (#1098)")
+                        "plug mating region derived from the board (#1098), "
+                        "and a declared assembly.body_edge_mm makes the "
+                        "body-to-edge band gate (#1255)")
     p.add_argument("--clearance", type=float, default=None,
                    help="Pad-model clearance in mm. Default: the board's own "
                         "Default net-class clearance, else routing_defaults. "
@@ -146,11 +162,18 @@ def main():
 
     waivers = ()
     declared_keepouts = ()
+    # #1255: the body-to-edge band the intent declares (None = nothing
+    # declared, and the census reports against the derived default without
+    # gating), and the refs whose edge it declares.
+    body_edge_mm = None
+    edge_claim_refs = ()
     if args.intent:
         try:
             from placement.floorplan import load_intent
             _intent = load_intent(args.intent)
             waivers = _intent.waiver_pairs()
+            body_edge_mm = _intent.body_edge_mm()
+            edge_claim_refs = _intent.edge_claim_refs()
             # #1098: the intent's keep-outs, so a declared `mating:<ref>`
             # replaces the derived plug region here as it does in the seeder.
             declared_keepouts = tuple(_intent.keepouts or ())
@@ -168,12 +191,6 @@ def main():
     g = grade_body_overlap(pcb, clearance, intent_waivers=waivers,
                            pcb_file=args.board,
                            courtyard_severity=_cy_sev_arg)
-    # #897: a waiver that resolves to nothing excuses nothing, and said nothing.
-    # Formatted by the engine (`format_waiver_warnings`) rather than here, so
-    # place_reconstruct says the same words.
-    from placement.legality import format_waiver_warnings as _waiver_warnings
-    for _line in _waiver_warnings(g):
-        print("  " + _line, file=sys.stderr)
     leg = grade_pad_legality(pcb, clearance, worst_n=0, pcb_file=args.board,
                              declared_keepouts=declared_keepouts)
     # #697: name any pair graded ABOVE `clearance` and what raised it, or the
@@ -185,18 +202,28 @@ def main():
     # COINCIDENT ORIGINS (run-19, measured twice): SW17+SW34+REF_PUCK_R all at
     # one point graded `buildable (blocking 0)` -- the pair currency counts pad
     # INTERSECTIONS, and the rotated pads happened to interleave. A stack of
-    # parts at one origin is unbuildable whatever the pads do, so it is its own
-    # blocking channel. The grouping and the exoneration are placement_state's
-    # prior art, reused rather than re-derived: assess_placement buckets every
-    # pad-bearing footprint by round(coord, 3), partitions each bucket by
-    # physical side (a drilled part is on both), and exonerates all-marker
-    # side-groups (fiducials, mounting holes, testpoints -- mouse-bites and
+    # parts at one origin is unbuildable even when no pad intersects, so it is
+    # its own blocking channel. The grouping and the exoneration are
+    # placement_state's prior art, reused rather than re-derived
+    # (`stack_suspects`, the rule assess_placement applies): every pad-bearing
+    # footprint is bucketed by round(coord, 3), each bucket is partitioned by
+    # physical side (a drilled part is on both), and all-marker side-groups
+    # are exonerated (fiducials, mounting holes, testpoints -- mouse-bites and
     # graphics markers are co-located by design and must NOT flag). A bucket is
     # a finding here only when it holds >= 2 suspect NON-marker parts: one real
     # part sitting on a fiducial is not a stack of parts.
     # `coincident_stack_groups` is that rule (fa10 P1: the seeder's #1151
     # disposition calls it too, so the two cannot disagree about a stack).
-    from placement.placement_state import coincident_stack_groups
+    # #1204: an origin is a library's datum, not a body, so a pair at one
+    # origin is a stack only when it shares something PHYSICAL on a face they
+    # both occupy -- copper pad boxes (run 19's interleaved pads still
+    # overlap), an NPTH hole on copper, or what this grade's body channel
+    # found (`body_contact_pairs`). CM5 IO's two module halves share one
+    # origin with 34 mm between their pads, and an `overlap_waivers` entry
+    # naming a pair now accepts its shared origin as it accepts its
+    # courtyard pair.
+    from placement.placement_state import (body_contact_pairs,
+                                           coincident_stack_groups)
     # Every footprint BLOCK is an entry here since #726: two blocks sharing a
     # reference are keyed `TP4` and `TP4~2`, so two parts at one point form a
     # coincident pair even when they answer to one name. Before that they
@@ -205,7 +232,23 @@ def main():
     # `coincident_origins 0` with TWO coincident pairs on it.
     # `duplicate_references` below still reports the naming, which is a
     # schematic question rather than a geometric one.
-    stack_groups = coincident_stack_groups(pcb, args.board)
+    stack_exempt: list = []
+    stack_groups = coincident_stack_groups(
+        pcb, args.board, contacts=body_contact_pairs(g), waivers=waivers,
+        exempt_out=stack_exempt)
+    # #897: a waiver that resolves to nothing excuses nothing, and said nothing.
+    # Formatted by the engine (`format_waiver_warnings`) rather than here, so
+    # place_reconstruct says the same words. A waiver that accepted a shared
+    # origin did excuse something (#1204), so it is not "unused".
+    _stack_used = {tuple(p) for e in stack_exempt
+                   for p in e.get('waived_pairs') or ()}
+    if _stack_used and g.get('waivers_unused'):
+        g = dict(g, waivers_unused=[
+            p for p in g['waivers_unused']
+            if tuple(sorted(p)) not in _stack_used])
+    from placement.legality import format_waiver_warnings as _waiver_warnings
+    for _line in _waiver_warnings(g):
+        print("  " + _line, file=sys.stderr)
     dup_refs = dict(getattr(pcb, 'duplicate_references', None) or {})
 
     new_advisory = None
@@ -294,6 +337,17 @@ def main():
         for grp in stack_groups:
             print(f"    {' '.join(grp['refs'])} @ "
                   f"({grp['point'][0]}, {grp['point'][1]})")
+    if stack_exempt:
+        # #1204: said, never silent -- an origin shared without a stack.
+        print(f"  SHARED ORIGINS, not stacks ({len(stack_exempt)}): no copper "
+              f"pad box, hole or drawn body shared on a face both occupy, or "
+              f"the pair is in the intent's overlap_waivers")
+        for grp in stack_exempt:
+            _w = ('waived: ' + ', '.join('<->'.join(p) for p in
+                                         grp.get('waived_pairs') or ())
+                  if grp['why'] == 'waived' else 'apart')
+            print(f"    {' '.join(grp['refs'])} @ "
+                  f"({grp['point'][0]}, {grp['point'][1]})  [{_w}]")
 
     locked_contact = g.get('locked_contact_pairs') or []
     if locked_contact:
@@ -387,10 +441,16 @@ def main():
     # locked_contact` is how the coincident-origin channel would have reached
     # two of them and silently missed the third.
     if g['contained']:
-        print(f"  CONTAINMENT ({g['contained']}): a part's .Fab body lies "
+        print(f"  CONTAINMENT ({g['contained']}): a part's drawn body (its "
+              f".Fab outline, else its silk united with its pads) lies "
               f"wholly or mostly inside another part's.")
         for q in g['containment_pairs']:
-            tag = f"  [waived:{q.waiver}]" if q.waived else ''
+            # #1201: the reason a pair does not gate, by name -- a silk-drawn
+            # body is not "a marker or a board-sized container".
+            _ex = getattr(q, 'gate_exempt', '')
+            tag = (f"  [does not gate: {_GATE_EXEMPT_WHY.get(_ex, _ex)}]"
+                   if _ex else
+                   f"  [waived:{q.waiver}, still gates]" if q.waived else '')
             print(f"    {q.a} <-> {q.b}  {q.area_mm2}mm2  "
                   f"{q.contained_frac:.0%} of the smaller body{tag}")
         if g['containment_blocking']:
@@ -404,9 +464,17 @@ def main():
             print(f"    To accept one deliberately, name the pair in the "
                   f"intent rather than relying on its class.")
         else:
-            print(f"    None of these BLOCK: each is a by-design containment "
-                  f"(a marker or a board-sized container), which the corpus "
-                  f"ships legitimately -- orangecrab FID2/J5 at 100%.")
+            _why = {}
+            for q in g['containment_pairs']:
+                _ex = getattr(q, 'gate_exempt', '')
+                _why[_ex] = _why.get(_ex, 0) + 1
+            print("    None of these BLOCK: " + '; '.join(
+                f"{n} {_GATE_EXEMPT_WHY.get(k, k)}"
+                for k, n in sorted(_why.items())) + '.')
+            if set(_why) <= {'marker_class', 'container_class'}:
+                print(f"    Each is a by-design containment (a marker or a "
+                      f"board-sized container), which the corpus ships "
+                      f"legitimately -- orangecrab FID2/J5 at 100%.")
     # BODY COVERAGE (#896). Printed UNCONDITIONALLY, including the fully
     # covered case: "which geometry was this board graded on" is a fact about
     # every run, and a line that appears only when something is missing cannot
@@ -428,10 +496,19 @@ def main():
               f"part (esp_prog's SOT89 draws corner brackets 5.2mm apart "
               f"around a 4.5mm part). Such pairs are reported, with their "
               f"source, and excluded from the blocking channels.")
+    _fr = g.get('fab_rejected_refs') or []
+    from placement.body import FAB_MIN_PAD_AREA_FRAC as _FAB_FRAC
+    if _fr:
+        print(f"    {len(_fr)} part(s) draw only a .Fab marking (under "
+              f"{_FAB_FRAC:.0%} of the pad box: a pin-1 dot, a single line; "
+              f"#1201), which is not their body: their drawn body is their "
+              f"silk where they draw one, and what they occupy is unchanged "
+              f"(their courtyard, else the marking united with their pads): "
+              + ', '.join(_fr[:8]) + (' ...' if len(_fr) > 8 else ''))
     if g['fab_unjudged']:
         _u = g['fab_unjudged_refs']
-        print(f"    {g['fab_unjudged']} part(s) draw no body at all (no .Fab, "
-              f"no usable silk), so the channel cannot judge them: "
+        print(f"    {g['fab_unjudged']} part(s) draw no usable body (no .Fab "
+              f"body, no usable silk), so the channel cannot judge them: "
               + ', '.join(_u[:8]) + (' ...' if len(_u) > 8 else ''))
 
     # ASSEMBLY SIDES (#837). Report-only, and deliberately not a conjunct:
@@ -576,6 +653,92 @@ def main():
               f"deliberate overlap is accepted by naming the pair in the "
               f"intent's `overlap_waivers`, where the acceptance is visible.")
 
+    # #1250: a TEST POINT whose pad copper lies under another part's drawn
+    # body -- no probe or bed-of-nails pin can reach it. The marker waiver
+    # every other channel gives a test point (courtyard `blocking_waived`,
+    # containment `_GATE_EXEMPT`) looks only at whether the test point is in
+    # someone's way, never at whether something now sits over it: glasgow's
+    # TP6 moved into U19's TSSOP body read `buildable`. Gated on the courtyard
+    # gate's currency (a member MOVED vs --baseline), because orangecrab ships
+    # TP26/TP27 under J4 by design; an author accepts a pair by naming it in
+    # the intent's `overlap_waivers`. A silk-drawn cover never gates (#896).
+    tp_cov = list(g.get('testpoint_covered') or [])
+    tp_gating = (legality.testpoint_covered_gating(tp_cov, moved_refs)
+                 if moved_refs is not None else [])
+    if tp_cov:
+        _gate_note = (
+            f"{len(tp_gating)} of {len(tp_cov)} GATE (a member moved vs the "
+            f"baseline)" if moved_refs is not None
+            else "REPORT-ONLY: pass --baseline <the board the run started "
+                 "from> to gate the ones your moves created")
+        print(f"  TEST POINT COVERED ({len(tp_cov)}): a test point's pad "
+              f"copper lies under another part's drawn body, where no probe "
+              f"can reach it -- {_gate_note}")
+        _gk = {(t.testpoint, t.cover) for t in tp_gating}
+        for t in tp_cov:
+            if not t.gates_if_moved:
+                _why = (f'  waived:{t.waiver}' if t.waiver
+                        else '  never gates: the body is drawn on silk')
+            elif moved_refs is None:
+                _why = ''
+            elif (t.testpoint, t.cover) in _gk:
+                _who = [r for r in (t.testpoint, t.cover) if r in moved_refs]
+                _why = '  GATES (moved: ' + ' '.join(_who) + ')'
+            else:
+                _why = "  baseline's own (no member moved)"
+            print(f"    {t.testpoint} under {t.cover}  {t.frac:.0%} of its "
+                  f"pad copper  body {t.body_source}  side {t.side}{_why}")
+        print("    A deliberate pose is accepted by naming the pair in the "
+              "intent's `overlap_waivers`.")
+
+    # #1255: each pad-bearing part's BODY against the real outline at margin
+    # 0. An assembler's rule, not the board's: JLCPCB asks 2.5 mm and adds
+    # edge rails when the file has none, and every human board measured
+    # breaks it -- so this GATES only when the intent declares
+    # `assembly.body_edge_mm`, and then every part in the band gates.
+    # Printed unconditionally, like BODY COVERAGE: a section that appears
+    # only when something is in the band cannot say what was measured.
+    band = legality.body_edge_band(pcb, args.board,
+                                   threshold_mm=body_edge_mm,
+                                   edge_claim_refs=edge_claim_refs,
+                                   moved=moved_refs)
+    edge_band_gating = []
+    if band['gates']:
+        edge_band_gating = list(band['in_band'])
+        if band['error']:
+            # Declared and unmeasurable: fail closed, and say why.
+            edge_band_gating = [{'ref': '?', 'mm': None, 'source': None,
+                                 'side': None, 'unmeasured': band['error']}]
+    if band['error']:
+        print(f"  BODY-TO-EDGE BAND NOT MEASURED -- {band['error']}"
+              + (" -- NOT BUILDABLE until it is" if band['gates'] else ''))
+    else:
+        _basis = ('declared in the intent (assembly.body_edge_mm) -- GATES'
+                  if band['gates'] else
+                  'derived_default: JLCPCB\'s assembly rule, one '
+                  'assembler\'s -- REPORT-ONLY; declare '
+                  'assembly.body_edge_mm in the intent to gate')
+        print(f"  BODY-TO-EDGE BAND: {len(band['in_band'])} of "
+              f"{band['eligible']} part(s) have a body within "
+              f"{band['threshold_mm']:g}mm of the board edge [{_basis}]"
+              + (f"  new_in_band {band['new_in_band']}"
+                 if band['new_in_band'] is not None else ''))
+        _new = set(band['new_in_band_refs'] or ())
+        for r in band['in_band'][:12]:
+            print(f"    {r['ref']} {r['mm']}mm ({r['source']}, side "
+                  f"{r['side']})" + ('  MOVED' if r['ref'] in _new else ''))
+        if len(band['in_band']) > 12:
+            print(f"    ... +{len(band['in_band']) - 12} more (--json)")
+        if band['excluded']:
+            print("    in the band but belonging at the edge, never counted "
+                  "(edge class, marker, or an edge the intent declares): "
+                  + ', '.join(f"{r['ref']} {r['mm']}mm [{r['why']}]"
+                              for r in band['excluded'][:8])
+                  + (' ...' if len(band['excluded']) > 8 else ''))
+        if band['unmeasured']:
+            print("    no body, courtyard or pad box to measure: "
+                  + ', '.join(band['unmeasured'][:8]))
+
     # A FOURTH conjunct, and `g['blocking']` is deliberately NOT touched.
     # `blocking` means "pad intersections" to board_score, to the seeder's
     # repair census, and -- with INVERTED polarity -- to the retired
@@ -641,10 +804,13 @@ def main():
             print(f"    {other} over {frame} {_kind} pin(s) "
                   f"{', '.join(x or f'(unnumbered {_kind})' for x in q.pins)}"
                   f"  {q.area_mm2}mm2  side {q.side}")
+    # #1250, the NINTH: a test point a move left under another part's body
+    # (`tp_gating`, above). #1255, the TENTH: a body inside the body-to-edge
+    # band the intent DECLARES (`edge_band_gating`, empty when undeclared).
     not_buildable = bool(g['blocking'] or locked_contact or stack_groups
                          or g['containment_blocking']
                          or courtyard_gating or off_outline_pads or mating
-                         or pin_hits)
+                         or pin_hits or tp_gating or edge_band_gating)
     verdict = 'NOT BUILDABLE' if not_buildable else 'buildable (blocking 0)'
     print(f"  VERDICT: {verdict}")
 
@@ -694,6 +860,8 @@ def main():
             'pin_in_courtyard_pairs': [q._asdict() for q in pin_hits],
             'fab_unjudged': g['fab_unjudged'],
             'fab_unjudged_refs': g['fab_unjudged_refs'],
+            # #1201: parts whose .Fab drawing is a marking, not a body.
+            'fab_rejected_refs': list(g.get('fab_rejected_refs') or []),
             # Run-23 courtyard channel. `courtyard_pairs` is EVERY
             # courtyard-kind pair (waived included, so a reader never
             # re-derives the census); `courtyard_blocking*` is the gated
@@ -725,6 +893,33 @@ def main():
                 1 for q in g['advisory_pairs'] if q.kind == 'courtyard'
                 and q not in g['courtyard_blocking_pairs']),
             'courtyard_synthetic_refs': g['courtyard_synthetic_refs'],
+            # #1250: test points whose pad copper lies under another part's
+            # drawn body, every one (`testpoint_covered_pairs`), and the
+            # subset that GATES -- a member moved vs --baseline. Like
+            # `courtyard_blocking_gating`, None (not 0) without a baseline.
+            'testpoint_covered': len(tp_cov),
+            'testpoint_covered_pairs': [t._asdict() for t in tp_cov],
+            'testpoint_covered_gating': (len(tp_gating)
+                                         if moved_refs is not None else None),
+            'testpoint_covered_gating_pairs': [t._asdict()
+                                               for t in tp_gating],
+            'testpoint_covered_basis': (
+                'a test point (part_class testpoint) whose copper pads, as '
+                'boxes about their centres (legality.bodyless_pad_shape), lie '
+                'at least CONTAINMENT_FRAC under another same-face part\'s '
+                'drawn body (fab, else silk). Gates when a member moved vs '
+                '--baseline, the body is .Fab, and the pair is not in the '
+                'intent\'s overlap_waivers or a container\'s. Fiducials are '
+                'not graded here.'),
+            # #1255: every pad-bearing part's body against the real outline
+            # at margin 0 (`legality.body_edge_band`: threshold and its basis,
+            # in_band / excluded rows, eligible and measured counts,
+            # new_in_band with --baseline). `body_edge_band_gating` is the
+            # count that GATES: the in-band parts when the intent declares
+            # `assembly.body_edge_mm`, else 0 -- the derived default (JLCPCB's
+            # 2.5 mm) is reported and never gates.
+            'body_edge_band': band,
+            'body_edge_band_gating': len(edge_band_gating),
             'blocking_pairs': [q._asdict() for q in g['blocking_pairs']],
             'advisory_pairs': [q._asdict() for q in g['advisory_pairs']],
             'pad_conflicts': leg['pad_conflicts'],
@@ -787,11 +982,20 @@ def main():
             # finding about one point, and the fix is one re-seat per part.
             'coincident_origin_groups': stack_groups,
             'coincident_origins': len(stack_groups),
+            # #1204: origins shared WITHOUT a stack, each with its `why`
+            # ('apart' or 'waived' + `waived_pairs`). Not a conjunct.
+            'coincident_origins_exempt': stack_exempt,
             'coincident_origins_basis': (
                 'every footprint BLOCK (#726): blocks sharing one reference '
                 'are keyed with an ordinal suffix, so they form a pair here '
                 'like any other two parts. See duplicate_references for the '
-                'names the board itself uses.'),
+                'names the board itself uses. A pair at one origin stacks '
+                'only when it shares something physical on a face both '
+                'occupy -- copper pad boxes (a plated barrel on both faces), '
+                'an NPTH hole on copper, or pad copper / a drawn body the '
+                'body channel found -- and is not in the intent\'s '
+                'overlap_waivers (#1204); coincident_origins_exempt names '
+                'the rest.'),
             'duplicate_references': dup_refs,
             # #837, report-only: additive keys, no exit code and no conjunct
             # moves. `parts_by_side` is the pad-bearing census -- the one the

@@ -17,7 +17,8 @@ board and `route` for a placed one. The positive test for which one is
 read `pile` and `has_copper` on its `JSON_SUMMARY` line (the file carries
 them under `state`); exit codes are not the test. Read `pile`, not
 `unplaced`: a staging ring of parts around the outline is a pile but reads
-`unplaced: false` (#1109). The same line's `poured_nets` names the nets a
+`unplaced: false` (#1109), and so does a pile whose fixed parts you placed
+and locked first -- `pile` measures the unlocked parts (#1165). The same line's `poured_nets` names the nets a
 copper pour already serves (`pours` in the file: layers, filled or not,
 coverage), which `has_copper` does not count; route.py's plane finalize
 serves those nets from the fill.
@@ -89,8 +90,11 @@ serves those nets from the fill.
   (`(locked yes)`), and there is no override. For a from-scratch experiment
   with everything off the board, build the input with
   `python3 -X utf8 .claude/skills/pcb-free-agent/scripts/make_unplaced.py <src> <dst>`.
-  It piles every pad-bearing part off the outline and removes each moved
-  part's lock. It refuses a routed input: strip that first with
+  It piles every pad-bearing part off the outline, removes each moved
+  part's lock, writes every moved part's texts at absolute 0, and drops the
+  board-level zones that outline the placement (a small zone holding a moved
+  part's pad; declare what it meant in the brief, or pass
+  `--keep-local-zones`). It refuses a routed input: strip that first with
   `python3 -X utf8 tests/stress/strip_copper_only.py <src> <dst>`, which keeps
   the outline bit-identical.
 - **Work in a run directory**, `wk/<run>/`. Copy every board with
@@ -107,7 +111,7 @@ Read `--help` before assuming a flag does not exist. Two runs declared
 
 | job | tools |
 |---|---|
-| score (the authority on `blocking`) | `py_tools/board_score.py <board> --intent <i> --baseline <input> --json <out>`; `check_complete.py <board> --intent <i> --baseline <input>` (fails closed; `--baseline` arms check_assembly's courtyard gate, and without it that gate is listed `ungraded`) |
+| score (the authority on `blocking`) | `py_tools/board_score.py <board> --intent <i> --baseline <input> --json <out>`; `check_complete.py <board> --intent <i> --baseline <input>` (fails closed; `--baseline` arms check_assembly's moved-part gates, courtyard overlap and a test point buried under a body; without it both are unarmed, and `ungraded` says so) |
 | read the board | `py_tools/board_brief.py <board> --json <out>`, `py_tools/board_context.py --md` (per-part sheet: pin order, `CROSSED` pairs) |
 | place from scratch | lock the fixed parts with `py_placer/place_pose.py` first, then `py_placer/place_seed.py` (about 5–15 min on a 250-part board; rank seeds with `py_placer/compare_seeds.py`) |
 | improve a placement | `py_placer/place_optimize.py --max-displacement 3` (the quench, for ROUGH placements), `py_placer/place_reconstruct.py` (structural damage), `place_seed --repair` (local violations) / `--reseat` (parts far off), `py_placer/place_portfolio.py --intent --lock --full-probe` (on a SEEDED board), `py_placer/converge.py poses --ref X` (rank one part's poses), `py_placer/place_fanout_clearance.py` |
@@ -351,7 +355,11 @@ Read `--help` before assuming a flag does not exist. Two runs declared
    replacing the verifier:
    ```bash
    python3 -X utf8 .claude/skills/pcb-free-agent/scripts/grade.py <board> --baseline <input> --intent <i> --mode <mode>
-   python3 -X utf8 .claude/skills/pcb-free-agent/scripts/measure.py --root .
+   python3 -X utf8 .claude/skills/pcb-free-agent/scripts/measure.py --self --evidence wk/<run>
    ```
    Add `--spec <name>=<value>` to `grade.py` for each spec flag the board
-   declares (e.g. `--spec net-min-widths=widths.json`).
+   declares (e.g. `--spec net-min-widths=widths.json`). `measure.py` must
+   run from your own shell: `--self` is the transcript making that call
+   (a subagent's included), checked against your work dir. It prints the
+   file it measured; if it refuses (exit 3), quote the refusal rather than
+   timing another transcript.

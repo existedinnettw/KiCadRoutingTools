@@ -47,6 +47,7 @@ already grade and the existing seat search already honours — ordinarily an
 | `fixed[]` | `context.brief.fixed` — carried; a row with a `pose` also compiles to `fixed_poses[]` (see below) | `basis: "declared"` |
 | `arrays[]` | `arrays[]`, one intent row per brief row, validated by the intent's own loader; `requirement` moves into `context` | `source: "brief"`, `context.brief_row` |
 | `mount_mode`, `cable_entry`, `cable_envelope_mm`, `product.user_top_side` | compiled by `connector_consequences` into `max_setback_mm`, `side` and cable `keepouts[]` -- see [below](#connector-declarations-compile-to-clauses-959) | `context.basis`, `context.compiled_from` |
+| `assembly.body_edge_mm` | `assembly.body_edge_mm`, merged into the emitted `assembly` block; `why` and `requirement` move into `assembly.context.body_edge_mm`. Graded by check_assembly's `body_edge_band`, not by a floorplan rule (see [below](#assemblybody_edge_mm-the-assemblers-edge-rule-1255)) | `context.basis`: `declared`, `min_reader` 9 |
 | `product`, `unknown[]` | `context` | — |
 
 ### The one key the compiler adds, and why that is the rule rather than an exception
@@ -459,6 +460,29 @@ keep-out finding names the part that intrudes, never the connector), a fired
 `abstained` and keeps coverage incomplete, and a `derived_default` number
 carries authority `assumption`: the declaration is the author's, the number is
 this code's.
+
+## `assembly.body_edge_mm`: the assembler's edge rule (#1255)
+
+```jsonc
+"assembly": {"body_edge_mm": 2.5,
+             "why": "JLCPCB assembly, no edge rails"}
+```
+
+This is the least distance a component body may sit from the board edge. The
+rule belongs to the assembler, and the board file has nowhere to put it. The
+value is mm (> 0) or `"unknown"`. An `assembly` block with no `body_edge_mm`
+is refused, since it would constrain nothing. `sides` is not declarable here,
+because the emitter observes it off the board.
+
+It compiles to the intent's `assembly.body_edge_mm`, beside the observed
+`sides`, with `min_reader` 9. That arms check_assembly's `body_edge_band`
+gate, and render_placement's `a_body_edge_band` under `--gate`. With no
+declaration, both report against JLCPCB's 2.5 mm, labelled `derived_default`,
+and never gate. No floorplan rule grades it, so `check_floorplan` lists the
+clause as carried and names check_assembly as the grader. On the `--intent`
+path, an intent without the value drifts. A connector whose interface
+declares an `edge` is listed apart from the band rather than counted, like an
+edge-class part.
 
 ## Deferred, and named rather than silently absent
 

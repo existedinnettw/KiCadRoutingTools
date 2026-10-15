@@ -338,7 +338,10 @@ def state_section(pcb, pcb_file, skipped):
             'spread_ratio': round(st.spread_ratio, 4),
             'outside_fraction': round(st.outside_fraction, 4),
             'stacked_suspect_refs': list(st.stacked_suspect_refs),
-            'segments': st.segments, 'vias': st.vias}
+            # #1164: has_copper counts teardrop zones too, so a reader
+            # seeing 0 segments and 0 vias can tell what tripped it.
+            'segments': st.segments, 'vias': st.vias,
+            'teardrops': st.teardrops}
 
 
 def pour_census(pcb, pcb_file=None):
@@ -354,10 +357,16 @@ def pour_census(pcb, pcb_file=None):
     FILLED in the file (an unfilled zone has its outline only), and the
     largest fraction of the board's copper area one layer's zones cover
     (zone outline clipped to the board outline). Footprint-owned pours are
-    listed apart; keep-out rule areas are counted, never listed as pours."""
+    listed apart; keep-out rule areas are counted, never listed as pours, and
+    so are KiCad's generated TEARDROP areas (#1164): routing output on a
+    signal net, which would otherwise list that net as poured."""
     import re
+    from kicad_parser import pour_zones
     bi = pcb.board_info
-    zones = [z for z in (getattr(pcb, 'zones', None) or [])
+    _all = getattr(pcb, 'zones', None) or []
+    teardrops = len({(z.uuid or id(z)) for z in _all
+                     if getattr(z, 'teardrop', False)})
+    zones = [z for z in pour_zones(_all)
              if (getattr(z, 'layer', '') or '').endswith('.Cu')
              and (getattr(z, 'net_name', '') or '').strip()]
     filled = {}
@@ -413,7 +422,8 @@ def pour_census(pcb, pcb_file=None):
         e['area_fraction'] = max(fr) if fr else None
         pours.append(e)
     return {'pours': pours,
-            'keepout_areas': len(getattr(bi, 'keepouts', None) or ())}
+            'keepout_areas': len(getattr(bi, 'keepouts', None) or ()),
+            'teardrop_areas': teardrops}
 
 
 def pours_section(pcb, pcb_file, skipped):
@@ -899,6 +909,7 @@ def build_brief(pcb, pcb_file, *, clearance=None, board_edge_clearance=None,
                 'outline and never another part, so on this board it is the '
                 'section that still answers "where could this go".'),
             'gate': ('state.unplaced' if st.get('unplaced')
+                     else 'state.pile' if st.get('pile')
                      else f'duplicate_fraction {dup:.3f} >= {PILE_FRACTION}'),
             'not_applied_to': (
                 'a board where only a few refs share a coordinate -- a '
@@ -918,9 +929,22 @@ def format_text(b):
              f"{bd.get('footprints')} parts, {bd.get('nets')} nets, "
              f"{len(bd.get('copper_layers') or [])} copper layers")
     if bd.get('size_mm'):
-        L.append(f"  outline {bd['size_mm'][0]} x {bd['size_mm'][1]} mm "
-                 f"({bd.get('area_mm2')} mm2), cutouts {bd.get('cutouts')}, "
-                 f"milled contours {bd.get('milled_contours')}")
+        # #1205: `size_mm`/`area_mm2` are the BOUNDING BOX. On a notched or
+        # eared board the outline encloses less, and printing the box alone as
+        # "outline" sent an agent to place edge parts against edges the board
+        # does not have (CM5_MINIMA_3: 3929.0 mm2 box, 3054.87 mm2 outline).
+        box = bd.get('area_mm2')
+        ring = bd.get('outline_area_mm2')
+        if ring is not None and box is not None and abs(ring - box) >= 0.01:
+            L.append(f"  outline bounding box {bd['size_mm'][0]} x "
+                     f"{bd['size_mm'][1]} mm ({box} mm2), outline area {ring} "
+                     f"mm2 ({100.0 * ring / box:.0f}% of the box), cutouts "
+                     f"{bd.get('cutouts')}, milled contours "
+                     f"{bd.get('milled_contours')}")
+        else:
+            L.append(f"  outline {bd['size_mm'][0]} x {bd['size_mm'][1]} mm "
+                     f"({box} mm2), cutouts {bd.get('cutouts')}, "
+                     f"milled contours {bd.get('milled_contours')}")
         if bd.get('cutout_area_mm2'):
             L.append(f"    copper {bd.get('copper_area_mm2')} mm2 -- "
                      f"{bd['cutout_area_mm2']} mm2 of the outline is cut out")
@@ -947,6 +971,9 @@ def format_text(b):
         L.append(f"  pours: {format_pours(pc)}")
     if pc.get('keepout_areas'):
         L.append(f"  keep-out rule areas: {pc['keepout_areas']}")
+    if pc.get('teardrop_areas'):
+        L.append(f"  teardrop areas: {pc['teardrop_areas']} (routing output, "
+                 f"not pours)")
     # BEFORE the numbers, not after them and not only in the JSON. This
     # printed `state: UNPLACED` and then, eleven lines later, an escape
     # deficit and a lock tally measured on the pile, in the same words a

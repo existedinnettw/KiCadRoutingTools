@@ -476,7 +476,9 @@ def analyze_impedance(pcb, net_patterns: Optional[List[str]] = None,
     # (#486 open question "which nets count as controlled-impedance": with no
     # per-net-class impedance notion on the board, the honest default is every
     # routed SIGNAL net, narrowed with --nets.)
-    pour_nets = {z.net_id for z in (getattr(pcb, 'zones', None) or [])
+    from kicad_parser import pour_zones
+    # A teardropped SIGNAL net is still a signal net (#1164).
+    pour_nets = {z.net_id for z in pour_zones(getattr(pcb, 'zones', None))
                  if z.net_id and z.polygon}
 
     selected = []

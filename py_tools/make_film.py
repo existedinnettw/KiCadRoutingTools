@@ -111,6 +111,92 @@ def shots_from_loop_dir(work_dir, include_rejected=True, cards=True):
     return shots
 
 
+def lineage_plan(entries, available=lambda sha: True, include_rejected=True):
+    """The film's beats for a ledger, in LINEAGE order (#1199).
+
+    Returns `(beats, shipped, tail_sha)`. Each beat is a dict: `index` (the
+    row), `kept` (False = the film badges it an attempt), and `cut`: None
+    when the beat tweens from the previous one, which is then its parent;
+    else `('parent', sha, row_or_None)` -- cut to its parent's board first,
+    so the tween and the "moving N part(s)" caption are measured against
+    the board the row was MADE from -- or `('self', sha, None)` when its
+    parent's board is not stored: the beat is cut to, never tweened from an
+    unrelated board. `tail_sha` is the shipped board when the last beat is
+    not it, so the film ends on what shipped.
+
+    A row's parent ROW is the latest EARLIER row whose `result_sha` is its
+    `parent_sha` (a re-recorded board is the same board). The shipped row is
+    the last `--final` row, else the last accepted one; walking its parents
+    back gives the shipped lineage. The order is a depth-first walk of the
+    parent tree that takes every node's side branches before the child the
+    shipped board descends from, so a side lineage plays as ONE contiguous
+    attempt off its branch point and the film ends on the shipped lineage.
+    It used to play rows in record order: two lineages recorded side by side
+    made the board fly from one placement to the other and back, captioned
+    "moving 67 part(s)" on a routing step that moved nothing.
+
+    A beat is kept when it is on the shipped lineage, or an accepted row of a
+    board that is. `include_rejected=False` films the kept beats only.
+    """
+    n = len(entries)
+    parent, latest = [None] * n, {}
+    for i, e in enumerate(entries):
+        ps = e.get('parent_sha')
+        parent[i] = latest.get(ps) if ps else None
+        if e.get('result_sha'):
+            latest[e['result_sha']] = i
+    avail = [i for i in range(n)
+             if entries[i].get('result_sha')
+             and available(entries[i]['result_sha'])]
+    if not avail:
+        return [], None, None
+    shipped = ([i for i in avail if entries[i].get('final')]
+               or [i for i in avail if entries[i].get('accepted')]
+               or avail)[-1]
+    spine, i = [], shipped
+    while i is not None:
+        spine.append(i)
+        i = parent[i]
+    on_spine = set(spine)
+    spine_shas = {entries[i].get('result_sha') for i in spine}
+
+    def kept(i):
+        return i in on_spine or (bool(entries[i].get('accepted'))
+                                 and entries[i].get('result_sha') in spine_shas)
+
+    children = {i: [] for i in range(n)}
+    roots = []
+    for i in range(n):
+        (roots if parent[i] is None else children[parent[i]]).append(i)
+    order = []
+    for root in ([r for r in roots if r not in on_spine] + [spine[-1]]):
+        stack = [root]
+        while stack:
+            i = stack.pop()
+            order.append(i)
+            kids = children[i]
+            # popped in file order: the side branches, then the spine child
+            stack.extend(reversed([k for k in kids if k not in on_spine]
+                                  + [k for k in kids if k in on_spine]))
+    beats, prev = [], None
+    for i in order:
+        if i not in avail or not (include_rejected or kept(i)):
+            continue
+        sha, ps = entries[i]['result_sha'], entries[i].get('parent_sha')
+        cut = None
+        if prev is not None:
+            if ps and available(ps):
+                if ps != prev:
+                    cut = ('parent', ps, parent[i])
+            elif sha != prev:
+                cut = ('self', sha, None)
+        beats.append({'index': i, 'kept': kept(i), 'cut': cut})
+        prev = sha
+    tail = (entries[shipped]['result_sha']
+            if beats and prev != entries[shipped]['result_sha'] else None)
+    return beats, shipped, tail
+
+
 def shots_from_ledger(ledger_path, store_root=None, work=None,
                       include_rejected=True):
     """The film of a `converge.py` run, straight off its ledger.
@@ -118,7 +204,9 @@ def shots_from_ledger(ledger_path, store_root=None, work=None,
     The ledger already records what this needs -- parent_sha, result_sha,
     accepted, kind, lever_argv -- so the film is the ledger read out loud, and
     each beat's caption is the actual lever that produced it rather than a
-    description of it.
+    description of it. The beats run in LINEAGE order (`lineage_plan`): each
+    one is drawn from its own parent's board, and a beat whose parent is not
+    the previous beat is CUT to, not tweened from it.
     """
     from board_store import BoardStore, Ledger
     # CALL the ladder, do not mirror it: converge writes these rows and owns
@@ -142,18 +230,25 @@ def shots_from_ledger(ledger_path, store_root=None, work=None,
     work = work or os.path.join(os.path.dirname(os.path.abspath(ledger_path)),
                                 '_film')
     os.makedirs(work, exist_ok=True)
-    shots, last_accepted = [], None
-    for e in entries:
-        sha = e.get('result_sha')
-        if not sha or not store.has(sha):
-            continue
-        acc = bool(e.get('accepted'))
-        if not acc and not include_rejected:
-            continue
-        dest = os.path.join(work, f"{e.get('iteration', len(shots))}_{sha[:8]}.kicad_pcb")
+
+    def _fetch(sha, name):
+        dest = os.path.join(work, f"{name}_{sha[:8]}.kicad_pcb")
         try:
             store.get(sha, dest)
         except Exception:
+            return None
+        return dest
+
+    def _it(i):
+        return entries[i].get('iteration', i)
+
+    beats, shipped, tail = lineage_plan(entries, store.has, include_rejected)
+    shots, n_cut = [], 0
+    for bt in beats:
+        e = entries[bt['index']]
+        sha = e['result_sha']
+        dest = _fetch(sha, _it(bt['index']))
+        if dest is None:
             continue
         argv = e.get('lever_argv') or []
         # `or ''` used to end the ladder here, so a row whose whole content
@@ -163,13 +258,37 @@ def shots_from_ledger(ledger_path, store_root=None, work=None,
         # is the one ladder (lever -> exhausted.reason -> stop_condition).
         lever = (' '.join(str(a) for a in argv[:6]) if argv
                  else _row_label(e))
-        head = f"i{e.get('iteration', '?')} {e.get('kind', 'completion')}"
-        if acc:
-            shots.append(board_shot(dest, f"{head}  {lever}".strip(), True))
-            last_accepted = dest
-        else:
-            shots.append(board_shot(dest, f"{head}  {lever}  -- not kept".strip(),
-                                    False, revert_to=last_accepted))
+        head = f"i{_it(bt['index'])} {e.get('kind', 'completion')}"
+        note = ('' if e.get('accepted') and bt['kept']
+                else '  -- not kept' if not e.get('accepted')
+                else '  -- side lineage')
+        s = board_shot(dest, f"{head}  {lever}{note}".strip(), bt['kept'])
+        s['iteration'] = _it(bt['index'])
+        if bt['cut'] is not None:
+            # its OWN extracted copy: the camera keys a board's move by its
+            # path, so a cut reusing the parent beat's file would overwrite
+            # that beat's move with this one's
+            kind, csha, crow = bt['cut']
+            n_cut += 1
+            s['cut_from'] = _fetch(csha, f"cut{n_cut}")
+            if kind == 'self':
+                s['cut_self'] = True
+                s['cut_label'] = s['label'] + '  (cut)'
+            elif crow is not None:
+                s['cut_label'] = (f"cut to i{_it(crow)}, the board "
+                                  f"i{s['iteration']} was made from")
+            else:
+                s['cut_label'] = (f"cut to the board i{s['iteration']} "
+                                  f"was made from")
+            if s['cut_from'] is None:
+                for k in ('cut_from', 'cut_label', 'cut_self'):
+                    s.pop(k, None)
+        shots.append(s)
+    if shots and tail:
+        back = _fetch(tail, 'shipped')
+        if back:
+            shots[-1]['back_to'] = back
+            shots[-1]['back_label'] = f"back to i{_it(shipped)}, the shipped board"
     return shots
 
 
@@ -314,6 +433,55 @@ def _badge(frame, text, rgb=None, theme=None):
     return frame
 
 
+def _shot_steps(s):
+    """The `build_boards` steps one board shot becomes, with their owners.
+
+    - a `cut_from` (#1199) comes FIRST: a silent cut to the board the beat
+      was made from (or to the beat itself when that board is not stored),
+      so the beat's tween and its "moving N part(s)" are measured against
+      its own parent, never against whatever beat happened to precede it;
+    - the beat itself;
+    - a rejected attempt's undo back to the kept board (`revert_to`), so the
+      NEXT beat's delta is measured against what was actually kept;
+    - a `back_to` (#1199): the last beat of a ledger film that is not the
+      shipped board cuts back to it, so the film ends on what shipped.
+
+    'revert' is animate_route's silent trueup, i.e. a cut: no glide, no
+    copper flashed as a rip, and movie_placement skips it as a re-shown
+    board.
+    """
+    out = []
+    if s.get('cut_from'):
+        out.append(((s['cut_label'], s['cut_from'], None, 'revert'),
+                    {'kind': 'board', 'cut': True, 'label': 'cut',
+                     # a cut to the beat ITSELF shows the beat: badge it so
+                     'accepted': (s['accepted'] if s.get('cut_self')
+                                  else True)}))
+    out.append(((s['label'], s['path'], None), s))
+    if not s['accepted'] and s.get('revert_to'):
+        out.append((('back to the kept board', s['revert_to'], None, 'revert'),
+                    {'kind': 'board', 'accepted': True, 'revert': True,
+                     'label': 'reverted'}))
+    if s.get('back_to'):
+        out.append(((s['back_label'], s['back_to'], None, 'revert'),
+                    {'kind': 'board', 'accepted': True, 'revert': True,
+                     'label': 'back to the shipped board'}))
+    return out
+
+
+def film_steps(shots):
+    """`(steps, owner)`: every board shot's steps in film order, and the
+    shot (or synthetic cut/undo record) each step belongs to."""
+    steps, owner = [], []
+    for s in shots:
+        if s['kind'] != 'board':
+            continue
+        for st, own in _shot_steps(s):
+            steps.append(st)
+            owner.append(own)
+    return steps, owner
+
+
 def build_film(shots, size=DEFAULT_SIZE, fps=DEFAULT_FPS, supersample=1,
                layer_alpha=None, rip_hold=2, chunks=6, camera='auto',
                camera_budget=0.0, tween=10, quiet=False, theme=None,
@@ -347,19 +515,7 @@ def build_film(shots, size=DEFAULT_SIZE, fps=DEFAULT_FPS, supersample=1,
     if not boards:
         return []
 
-    # A rejected attempt is followed by an explicit undo back to the last
-    # accepted board, so the NEXT beat's delta is measured against what was
-    # actually kept -- not against a board that was thrown away.
-    steps, owner = [], []
-    for s in shots:
-        if s['kind'] != 'board':
-            continue
-        steps.append((s['label'], s['path'], None))
-        owner.append(s)
-        if not s['accepted'] and s.get('revert_to'):
-            steps.append(('back to the kept board', s['revert_to'], None, 'revert'))
-            owner.append({'kind': 'board', 'accepted': True, 'revert': True,
-                          'label': 'reverted'})
+    steps, owner = film_steps(shots)
     final = steps[-1][1]
 
     stage = None
@@ -492,10 +648,9 @@ def _build_film_body(a, frame_spool, sink, steps, final, size, supersample,
                 [_card_frame(size_wh, c['path'], c['caption'], theme=_th)]
                 * hold_frames(c['hold']))
         pending = []
-        # skip the auto-inserted revert step so the pairing stays aligned
-        mark_i += 1
-        if not s['accepted'] and s.get('revert_to'):
-            mark_i += 1
+        # skip the auto-inserted cut / revert steps so the pairing stays
+        # aligned: the same list film_steps built the steps from
+        mark_i += len(_shot_steps(s))
     for c in pending:
         inserts.setdefault(len(frames), []).extend(
             [_card_frame(size_wh, c['path'], c['caption'], theme=_th)]

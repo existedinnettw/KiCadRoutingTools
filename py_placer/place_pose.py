@@ -19,6 +19,9 @@ not when it is staged (#960).
 SEVERAL VERBS IN ONE CALL describe ONE arrangement: every op is resolved
 against the INPUT board and written in a single pass, so no op sees another's
 effect and the result is one board state rather than a replayed sequence.
+That arrangement is graded at the exact points given, so a snap needs a call
+with ONE pose op: `--near` with a second pose op is refused at exit 2 (one
+`set REF --near X Y` per call), and `--snap` there is skipped and said so.
 
 EXIT CODES. 0 written; 2 the request does not name a thing on this board (bad
 arguments, an unreadable board, an unknown ref, a face with no pad row) -- a
@@ -90,10 +93,15 @@ VERBS = ('set', 'rotate', 'face', 'lock', 'unlock')
 #: `krt_capabilities.FLAG_SCRIPTS` for the same reason -- that contract is
 #: "every flag this script accepts is visible in --help as an option and
 #: accepted at the top level", and a per-verb flag is neither.)
-VERB_HELP = """verbs (several in one call describe ONE arrangement):
+VERB_HELP = """verbs (several in one call describe ONE arrangement, graded at the
+exact points given -- so --near / --snap need a call with ONE pose op):
 
   set REF [X Y] [--rot DEG] [--near X Y]
-            --near X Y   the same point read as APPROXIMATE; implies --snap
+            --near X Y   the same point read as APPROXIMATE; implies --snap.
+                         Only in a call with exactly one pose op (set /
+                         rotate / face; lock and unlock may ride along): a
+                         second pose op is refused at exit 2 -- issue one
+                         `set REF --near X Y` per call
             --rot DEG    absolute rotation; omitted, the part keeps its own
   rotate REF DEG [--relative]
             --relative   add to the current rotation instead of replacing it
@@ -142,7 +150,10 @@ def build_parser(with_verbs=True):
                         "pose_score, then RE-GRADED here -- the ranker's "
                         "legality is an AABB gate and this verb's verdict is "
                         "exact geometry, so a candidate is verified, never "
-                        "trusted). Implied by --near")
+                        "trusted). Implied by --near. Applies to a call with "
+                        "exactly ONE pose op (set/rotate/face): on a call "
+                        "with several it is skipped, and the summary and "
+                        "stderr say so")
     p.add_argument('--radius', type=float, default=2.0, metavar='MM',
                    help='How far --snap may move the part, as a straight-line '
                         "distance (default: 2.0mm). The underlying sweep is a "
@@ -219,7 +230,8 @@ def _verb_parsers(sub=None):
     q.add_argument('--near', nargs=2, type=float, metavar=('X', 'Y'),
                    help='the same coordinates read as APPROXIMATE: implies '
                         '--snap, so the engine seats the part at the best '
-                        'legal pose near the point you aimed at')
+                        'legal pose near the point you aimed at. One pose op '
+                        'per call: with a second one it is refused (exit 2)')
     q.add_argument('--rot', type=float, default=None,
                    help='absolute rotation in degrees; omitted, the part '
                         'keeps the rotation it has')
@@ -315,6 +327,21 @@ def parse_segments(segments, parsers, error):
             locks.extend(a.refs)
         elif verb == 'unlock':
             unlocks.extend(a.refs)
+    if snap and len(ops) > 1:
+        # #1194: a call with several pose ops is ONE arrangement graded at the
+        # exact points given, and a snap relocates one part, so `apply_poses`
+        # cannot snap here. Refused BEFORE anything is graded, because the
+        # alternative grades points the caller marked approximate as exact
+        # and refuses them for it (fa10 board 10: two `set --near` ops
+        # refused at exit 4, while each alone snapped and was written). A
+        # usage error like its neighbours above.
+        error("--near snaps ONE pose op, and this call carries %d (%s): "
+              "several ops are one arrangement graded at the exact points "
+              "given, so a --near point would be graded as exact. Issue one "
+              "`set REF --near X Y` per call (lock / unlock may ride along), "
+              "or give exact coordinates"
+              % (len(ops), ', '.join('%s %s' % (o['kind'], o['ref'])
+                                     for o in ops)))
     return ops, locks, unlocks, snap
 
 
@@ -373,11 +400,11 @@ def main(argv=None):
     if st.has_copper and not args.allow_routed:
         return _refuse(
             args,
-            "this board carries %d segment(s) and %d via(s); moving a "
+            "this board carries %s; moving a "
             "footprint strands every track attached to it. Pose the unrouted "
             "board, or pass --allow-routed if you mean to."
-            % (st.segments, st.vias), UNPLACED_EXIT,
-            segments=st.segments, vias=st.vias)
+            % st.copper_carried, UNPLACED_EXIT,
+            segments=st.segments, vias=st.vias, teardrops=st.teardrops)
     intent = None
     if args.intent:
         from placement import floorplan

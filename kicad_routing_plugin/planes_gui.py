@@ -1183,8 +1183,9 @@ class PlanesTab(wx.Panel):
         # cannot distinguish "already there, nothing to do" from a real failure --
         # both arrive as zero new zones.
         try:
+            from kicad_parser import pour_zones
             _have = {(z.net_name, z.layer)
-                     for z in (getattr(self.pcb_data, 'zones', None) or [])}
+                     for z in pour_zones(getattr(self.pcb_data, 'zones', None))}
             zones_kept = sum(1 for _n, _l in zip(expanded_nets, expanded_layers)
                              if (_n, _l) in _have)
         except Exception:

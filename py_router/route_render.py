@@ -315,9 +315,15 @@ class BoardRenderer:
         Wp, Hp = self.W * self.ss, self.H * self.ss
         self._base = Image.new('RGB', (Wp, Hp), self.bg)
         d = ImageDraw.Draw(self._base)
+        # #1205: the board body as a mask, so a zone drawn past the board (the
+        # usual KiCad habit -- KiCad clips the FILL) paints only where the
+        # board is. Built per view, from the same rings `_draw_outline` fills.
+        m = Image.new('L', (Wp, Hp), 0)
+        self._board_mask = m if self._paint_body(ImageDraw.Draw(m), 255, 0) \
+            else None
         self._draw_outline(d)
         if self._show_zones and not self.dynamic_zones:
-            self._draw_zones(d)
+            self._draw_zones(self._base)
         # With dynamic_zones the pours are drawn per-frame, so pads must be too
         # (drawn AFTER the pour so they read on top of it, as in the static base).
         if self._show_pads and not self.dynamic_zones:
@@ -346,19 +352,39 @@ class BoardRenderer:
                 self._pad_mask = None   # never fail a render over a mask
 
     # -- substrate -------------------------------------------------------
-    def _draw_outline(self, d: ImageDraw.ImageDraw) -> None:
+    def _outline_rings(self):
         bi = self.pcb.board_info
         outlines = bi.board_outlines or ([bi.board_outline] if bi.board_outline else [])
-        cutouts = getattr(bi, 'board_cutouts', None) or []
+        return outlines, getattr(bi, 'board_cutouts', None) or []
+
+    def _paint_body(self, d: ImageDraw.ImageDraw, body, hole) -> bool:
+        """Fill the board body in `body` and its cutouts in `hole`: the outline
+        rings, else the bounds rectangle. False when there is no board at all.
+
+        One routine for the visible body and for `_board_mask` (#1205), so the
+        zone clip can never disagree with the board that is drawn."""
+        bi = self.pcb.board_info
+        outlines, cutouts = self._outline_rings()
         if outlines:
             for poly in outlines:
                 if len(poly) >= 3:
-                    d.polygon([self.tf.pt(x, y) for x, y in poly],
-                              fill=self.theme.rgb('board_body'))
+                    d.polygon([self.tf.pt(x, y) for x, y in poly], fill=body)
             for poly in cutouts:
                 if len(poly) >= 3:
-                    d.polygon([self.tf.pt(x, y) for x, y in poly], fill=self.bg)
-            ew = max(1, int(round(self.tf.length(0.15))))
+                    d.polygon([self.tf.pt(x, y) for x, y in poly], fill=hole)
+            return True
+        if bi.board_bounds:
+            (x0, y0, x1, y1) = bi.board_bounds
+            d.rectangle([self.tf.pt(x0, y0), self.tf.pt(x1, y1)], fill=body)
+            return True
+        return False
+
+    def _draw_edge(self, d: ImageDraw.ImageDraw) -> None:
+        """The Edge.Cuts stroke, on top of whatever the body carries."""
+        bi = self.pcb.board_info
+        outlines, _cutouts = self._outline_rings()
+        ew = max(1, int(round(self.tf.length(0.15))))
+        if outlines:
             for poly in outlines:
                 if len(poly) >= 2:
                     pts = [self.tf.pt(x, y) for x, y in poly]
@@ -367,24 +393,39 @@ class BoardRenderer:
         elif bi.board_bounds:
             (x0, y0, x1, y1) = bi.board_bounds
             d.rectangle([self.tf.pt(x0, y0), self.tf.pt(x1, y1)],
-                        fill=self.theme.rgb('board_body'),
-                        outline=self.theme.rgb('board_edge'),
-                        width=max(1, int(round(self.tf.length(0.15)))))
+                        outline=self.theme.rgb('board_edge'), width=ew)
 
-    def _draw_zones(self, d: ImageDraw.ImageDraw, net_ids=None) -> None:
+    def _draw_outline(self, d: ImageDraw.ImageDraw) -> None:
+        self._paint_body(d, self.theme.rgb('board_body'), self.bg)
+        self._draw_edge(d)
+
+    def _draw_zones(self, img: Image.Image, net_ids=None) -> None:
         # Plane pours drawn dim, under the tracks, tinted by layer. The stored
         # polygon is the zone OUTLINE (not the computed fill) -- a good-enough
         # substrate hint for a debug view. ``net_ids`` (a set) restricts to those
         # nets' zones, for animating a plane "filling in" per frame.
-        for z in getattr(self.pcb, 'zones', []) or []:
-            if z.layer not in self._layer_set or len(z.polygon) < 3:
-                continue
-            if net_ids is not None and z.net_id not in net_ids:
-                continue
+        #
+        # #1205: CLIPPED to the board. KiCad clips a pour's fill to the
+        # outline, so a GND zone drawn as a rectangle past the board is the
+        # usual habit, and painting it unclipped turned a notched board into
+        # its bounding box (CM5_MINIMA_3: notch, ears and edge all covered).
+        # The edge is stroked again on top, as the fill would leave it.
+        zones = [z for z in getattr(self.pcb, 'zones', []) or []
+                 if z.layer in self._layer_set and len(z.polygon) >= 3
+                 and (net_ids is None or z.net_id in net_ids)]
+        if not zones:
+            return
+        mask = getattr(self, '_board_mask', None)
+        layer = img.copy() if mask is not None else img
+        d = ImageDraw.Draw(layer)
+        body = self.theme.rgb('board_body')
+        for z in zones:
             base = self.palette.get(z.layer, self.theme.rgb('zone_tint'))
-            body = self.theme.rgb('board_body')
             dim = tuple(int(body[i] * 0.55 + base[i] * 0.45) for i in range(3))
             d.polygon([self.tf.pt(x, y) for x, y in z.polygon], fill=dim)
+        if mask is not None:
+            img.paste(layer, (0, 0), mask)
+        self._draw_edge(ImageDraw.Draw(img))
 
     def zone_net_ids(self):
         """Net ids that have at least one drawable plane zone (for the animator
@@ -583,11 +624,11 @@ class BoardRenderer:
             opaque_crossings = self.opaque_crossings
         img = self._base.copy()
         if self.dynamic_zones:
-            dz = ImageDraw.Draw(img)
             if zone_net_ids:
-                self._draw_zones(dz, net_ids=zone_net_ids)
+                self._draw_zones(img, net_ids=zone_net_ids)
             if self._show_pads:
-                self._draw_pads(dz)   # pads on top of the (dynamic) pour
+                # pads on top of the (dynamic) pour
+                self._draw_pads(ImageDraw.Draw(img))
         by_layer = self._group_by_layer(segs)
         # Draw layers in reverse stack order (B.Cu first ... F.Cu last, so the
         # top copper reads as "nearest the viewer"). With layer_alpha < 255 each

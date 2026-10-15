@@ -60,7 +60,9 @@ def tap_relocation_max() -> int:
 def plane_zone_net_ids(pcb_data: PCBData) -> Set[int]:
     """Nets with a filled zone: removing one of their vias is repairable
     from the pour by the plane-repair step."""
-    return {z.net_id for z in pcb_data.zones if z.net_id > 0}
+    from kicad_parser import pour_zones
+    # A teardrop (#1164) is no pour: it repairs nothing a removed via left.
+    return {z.net_id for z in pour_zones(pcb_data.zones) if z.net_id > 0}
 
 
 def _attached_stub(pcb_data: PCBData, via: Via, max_len_mm: float = 2.0

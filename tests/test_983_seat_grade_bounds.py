@@ -190,6 +190,27 @@ def input_rotation():
                         lambda part, claim, fits=None: part.rot)
 
 
+def _pad_only(fn):
+    """#1172: run a #1125 walk test with the courtyard tier OFF.
+
+    These pin the walk's mechanics on PAD crowding. With the tier on,
+    stage 1 also refuses a rung over a placed courtyard, and on this fixture
+    J5's centred 180-degree seat overlaps J16 and J18 by 19.4 mm2 each, so
+    the walk takes 90 for a reason these tests do not describe -- that case
+    is test_c20."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(self, *a, **k):
+        saved = seeder._edge_courtyard_tier
+        seeder._edge_courtyard_tier = False
+        try:
+            return fn(self, *a, **k)
+        finally:
+            seeder._edge_courtyard_tier = saved
+    return run
+
+
 class StageOneRotation(_Graded):
     J5 = {'ref': 'J5', 'edge': 'north', 'overhang_mm': {'min': 0.0, 'max': 0.8}}
 
@@ -524,6 +545,7 @@ class StageOneRotation(_Graded):
     def j5_notes(self, res):
         return [n for n in res['notes'] if n.startswith('edge connector J5')]
 
+    @_pad_only
     def test_c14_a_member_that_only_crowds_is_walked_past(self):
         # #1125: J5 declared [180, 90] used to keep 180, whose only seat on
         # the north band crowds J17, and say so; 90 seats clear.
@@ -561,6 +583,7 @@ class StageOneRotation(_Graded):
         self.assertEqual(len([n for n in self.j5_notes(res)
                               if 'clears J17' in n]), 1)
 
+    @_pad_only
     def test_c16_a_member_that_seats_clear_is_not_walked(self):
         # Nothing crowds when J17 is not yet placed: J5 keeps its own angle,
         # and the author's order still decides between members that both
@@ -600,6 +623,48 @@ class StageOneRotation(_Graded):
             return real(state, part, *a, **k)
         return patch.object(seeder, 'edge_seat_ok', ok)
 
+    def test_c20_the_courtyard_tier_walks_past_an_overlapping_member(self):
+        """#1172: C16's case with the tier ON. J5's centred 180-degree seat
+        clears every pad but overlaps J16 and J18's courtyards (19.4 mm2
+        each); 90 seats clear of both, so the walk takes it and says why."""
+        doc = intent_doc(dict(self.J5, **self.CENTRE),
+                         blocks=[{'name': 'j5', 'refs': ['J5'],
+                                  'rotation_candidates': [180, 90]}])
+        res = self.stage1(SPLIT, doc, seed_refs={'J5', 'J17'})
+        self.assertAlmostEqual(self.pose(res, 'J5')[2] % 360.0, 90.0,
+                               delta=1e-9)
+        self.assertTrue([n for n in res['notes'] if '(#1125)' in n],
+                        res['notes'])
+
+    def test_c21_the_fall_back_note_names_the_pad_clear_seat_it_keeps(self):
+        """#1172 with #1125: 180 crowds J17's pads (or is refused after the
+        turn) and 90 seats pad-clear but over a placed courtyard (made so
+        here), so no member seats clean and the walk keeps 90's pad-clear
+        seat. The note names THAT seat -- it used to name 180's crowded seat,
+        or say J5 was "left to the later stages" while stage 1 had seated it
+        (final review)."""
+        real = seeder._placed_courtyard_hits
+
+        def hits(state, ref, pose, others):
+            if ref == 'J5' and abs((pose[2] - 90.0 + 180.0) % 360.0
+                                   - 180.0) < 1e-6:
+                return ['J16']
+            return real(state, ref, pose, others)
+        for refused in ((), (180.0,)):
+            with self.subTest(refused=refused), \
+                    patch.object(seeder, '_placed_courtyard_hits', hits), \
+                    self.refusing(refused):
+                res = self.seat_j5_set([180, 90])
+                self.assertAlmostEqual(self.pose(res, 'J5')[2] % 360.0, 90.0,
+                                       delta=1e-6)
+                notes = self.j5_notes(res)
+                self.assertTrue([n for n in notes if
+                                 'keeps the pad-clear seat of 90deg' in n],
+                                notes)
+                self.assertFalse([n for n in notes if 'crowded seat of' in n
+                                  or 'left to the later stages' in n], notes)
+
+    @_pad_only
     def test_c17_a_member_refused_after_the_turn_is_walked_past(self):
         clear90 = self.seat_j5_single(90)
         with self.refusing((180.0,)):
@@ -629,6 +694,7 @@ class StageOneRotation(_Graded):
                         res['notes'])
         self.assertFalse([n for n in res['notes'] if 'keeps the crowded' in n])
 
+    @_pad_only
     def test_c19_a_clear_seat_short_of_the_floor_is_not_walked(self):
         # A conflict-free rung the edge-copper floor reads short of is KEPT
         # (`_kept`) -- it crowds nothing, so it is not a member to walk past.

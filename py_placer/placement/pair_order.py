@@ -211,6 +211,18 @@ def pair_metrics(state, ref_a: str, ref_b: str,
     common = [nid for nid in shared if nid in ea and nid in eb]
     if len(common) < 2:
         return None
+    return _order_metrics(common, ea, eb, vx, vy)
+
+
+def _order_metrics(common, ea, eb, vx, vy) -> Dict:
+    """The order comparison itself, given each side's escape pad per net.
+
+    `common` is the net ids both sides carry, in ascending id order (the sort
+    tie-break), `ea` / `eb` map each to its escape pad, and (vx, vy) is the
+    channel's cross-section axis. Split out of `pair_metrics` so a pair whose
+    two ends carry DIFFERENT net ids -- one conductor renamed by a series part,
+    `composed_pair_metrics` -- is judged by this code rather than a copy.
+    """
     order_a = sorted(common, key=lambda nid: (ea[nid][0] * vx + ea[nid][1] * vy,
                                               nid))
     rank_b = {nid: i for i, nid in enumerate(
@@ -236,6 +248,46 @@ def pair_metrics(state, ref_a: str, ref_b: str,
         return sum(1 for i in range(1, len(proj)) if proj[i] == proj[i - 1])
     return {'inversions': _merge_count(seq), 'lis': lis, 'nets': len(common),
             'ties': _ties(ea) + _ties(eb)}
+
+
+def composed_pair_metrics(state, ref_a: str, ref_b: str,
+                          nets_a, nets_b) -> Optional[Dict]:
+    """`pair_metrics` for two parts that share NO net: the ends of a
+    differential pair that runs through per-leg series parts (#1251).
+
+    U1 -> C42/C43 -> GPDI1 carries one signal on four net ids: U1 holds
+    FPDI_D0+/-, GPDI1 holds /gpdi/GPDI_D0+/-, and each cap holds one of
+    each. `pair_metrics` asks about SHARED nets, so the two end parts have
+    nothing to compare. Here ``nets_a[i]`` on `ref_a` and ``nets_b[i]`` on
+    `ref_b` are named as one conductor; B's escape pads are re-keyed to A's
+    net ids and judged by the same `_order_metrics`, on the axis between the
+    two end parts. The series parts are not consulted: this is the end-to-end
+    parity, the question a crossover (#1055) would have to answer.
+
+    None when a side lacks an escape pad for two of the conductors, the
+    parts coincide, or either ref is not a part of `state`.
+    """
+    pa, pb = state.parts.get(ref_a), state.parts.get(ref_b)
+    if pa is None or pb is None or len(nets_a) != len(nets_b):
+        return None
+    own_a = _part_net_set(state, ref_a, pa)
+    own_b = _part_net_set(state, ref_b, pb)
+    alias = {nb: na for na, nb in zip(nets_a, nets_b)
+             if na in own_a and nb in own_b}
+    if len(alias) < 2 or len(set(alias.values())) != len(alias):
+        return None
+    ux, uy = pb.x - pa.x, pb.y - pa.y
+    n = math.hypot(ux, uy)
+    if n < 1e-9:
+        return None                      # coincident parts: no channel axis
+    vx, vy = -uy / n, ux / n
+    ea = _escape_pads(pa, set(alias.values()), (pb.x, pb.y))
+    eb = {alias[nid]: xy for nid, xy in
+          _escape_pads(pb, set(alias), (pa.x, pa.y)).items()}
+    common = [nid for nid in sorted(alias.values()) if nid in ea and nid in eb]
+    if len(common) < 2:
+        return None
+    return _order_metrics(common, ea, eb, vx, vy)
 
 
 def pair_inversions(state) -> Dict[Tuple[str, str], Dict]:

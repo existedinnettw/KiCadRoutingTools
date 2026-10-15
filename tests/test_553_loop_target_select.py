@@ -266,12 +266,15 @@ def t_the_default_verdict_gains_exactly_one_key():
     # so a machine consumer cannot read the verdict without learning which one
     # ran. Updating this list is the intended way to admit such a key -- the
     # guard exists to make the addition a decision rather than an accident.
+    # `rounds_rejected_pad_stacks` (#858) is an always-on GATE's count, not a
+    # mode, so 0 must read "checked, none" rather than be absent.
     check(sorted(s) == [
         'failed_nets_after', 'failed_nets_before', 'failures_after',
         'failures_before', 'group_by', 'iterations_after', 'iterations_before',
         'max_displacement', 'max_target_pins', 'output', 'relocate', 'rounds',
-        'rounds_accepted', 'rounds_run', 'rounds_screened', 'target_select',
-        'vias_after', 'vias_before', 'work_dir'],
+        'rounds_accepted', 'rounds_rejected_pad_stacks', 'rounds_run',
+        'rounds_screened', 'target_select', 'vias_after', 'vias_before',
+        'work_dir'],
         f'and the verdict is the OLD key set plus exactly target_select '
         f'({sorted(s)})')
 

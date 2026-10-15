@@ -243,7 +243,7 @@ def _seeder_forecast(doc, pcb, board, sources):
     the pile it seeds (place_seed's own rule, `stacked_suspect_refs`)."""
     from placement import seeder
     from placement.floorplan import resolve_blocks
-    from placement.placement_state import assess_placement
+    from placement.placement_state import SEED_STACKED, assess_placement
     try:
         intent = intent_from_dict(doc, board)
         blocks, _probs = resolve_blocks(intent, pcb, sources or ())
@@ -251,7 +251,8 @@ def _seeder_forecast(doc, pcb, board, sources):
         return {'unavailable': str(exc)}
     standing = set((doc.get('context') or {}).get('file_locked') or ())
     st = assess_placement(pcb, board)
-    partial = bool(st.partially_unplaced and not st.unplaced)
+    # place_seed's scope, by its own predicate (#1165: `seed_scope`).
+    partial = st.seed_scope == SEED_STACKED
     if partial:
         standing |= set(pcb.footprints) - set(st.stacked_suspect_refs)
     out = seeder.decap_pin_forecast(pcb, intent, blocks,
@@ -768,6 +769,12 @@ def main(argv=None):
             if cen.get('decap_ungraded_promoted'):
                 print(f"  decaps: decap_ungraded promoted to error -- "
                       f"{cen['decap_ungraded_promoted']}")
+            # #1178: a placed reference with parts sharing an origin is read
+            # as placed (a pile is refused), and the shared ones are named.
+            if cen.get('reference_stacked_refs'):
+                print(f"  decaps: the reference was read as placed although "
+                      f"{', '.join(cen['reference_stacked_refs'])} share an "
+                      f"origin -- it is not a pile (#1109's `pile`)")
             # The two causes are printed SEPARATELY (#792). One number
             # used to carry both, and the doc explained it with a third
             # cause -- a predicate mismatch -- that measurement says does
@@ -920,11 +927,20 @@ def main(argv=None):
                                 consequences=(brief_report or {}).get(
                                     'consequences'))
     ledger_s = ledger_summary(ledger)
-    if not args.quiet and ledger_s['carried_facts']:
-        print(f"  {len(ledger_s['carried_facts'])} declared fact(s) are "
+    # #1255: a carried fact ANOTHER instrument grades is named with it, so
+    # the sentence below stays true of the facts it lists.
+    from placement.design_brief import GRADED_ELSEWHERE as _elsewhere
+    _carried = [f for f in ledger_s['carried_facts'] if f not in _elsewhere]
+    _graded_by = [f for f in ledger_s['carried_facts'] if f in _elsewhere]
+    if not args.quiet and _carried:
+        print(f"  {len(_carried)} declared fact(s) are "
               f"CARRIED, NOT physically checked -- no rule measures them, "
               f"whatever `complete` says: "
-              f"{', '.join(ledger_s['carried_facts'])}")
+              f"{', '.join(_carried)}")
+    if not args.quiet and _graded_by:
+        print(f"  {len(_graded_by)} declared fact(s) are graded by another "
+              f"instrument, not by this one: "
+              + ', '.join(f"{f} ({_elsewhere[f]})" for f in _graded_by))
 
     if args.json:
         doc = to_json(result)

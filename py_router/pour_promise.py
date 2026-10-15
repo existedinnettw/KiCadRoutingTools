@@ -52,7 +52,9 @@ def promised_pads_on_board(pcb_data, promises: Dict[str, dict]):
     for fp in pcb_data.footprints.values():
         for p in fp.pads:
             by_key.setdefault(f"{p.component_ref}.{p.pad_number}", p)
-    zone_net_ids: Set[int] = {z.net_id for z in (getattr(pcb_data, 'zones', None) or [])}
+    from kicad_parser import pour_zones
+    # A teardrop (#1164) keeps no pour promise.
+    zone_net_ids: Set[int] = {z.net_id for z in pour_zones(getattr(pcb_data, 'zones', None))}
     name_to_id = {n.name: nid for nid, n in pcb_data.nets.items()}
     found, stale = [], []
     for key in sorted(promises):

@@ -18,7 +18,7 @@ Detection is a pure, side-effect-free read of the parsed board.
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-from kicad_parser import PCBData
+from kicad_parser import PCBData, non_aperture_pads
 from routing_config import DiffPairNet
 
 
@@ -64,6 +64,13 @@ def find_ac_coupled_xnets(
     junctions are skipped and reported as warnings, so the caller keeps today's
     per-side behavior for them.
 
+    "2-pad" counts ``kicad_parser.non_aperture_pads`` (#1251), the same rule
+    #1143/#1148 gave the placement readers: a paste-only window (pad ``""``
+    on ``F.Paste`` alone) is not a pin. A 0201 resistor drawn with two such
+    windows besides its copper pads has four ``fp.pads``, and counting those
+    rejected the USB series resistors on rp2350_fpga_eensy_prePlane (R4/R5)
+    and orangecrab_ext_pll (R21/R29), so neither board's USB XNet was found.
+
     ``diff_pairs`` is the dict returned by ``find_differential_pairs``; its keys
     are used as stable pair identifiers.
 
@@ -81,9 +88,12 @@ def find_ac_coupled_xnets(
     # part: junctions[(keyX, keyY)] -> {'P': ref, 'N': ref}.
     junctions: Dict[Tuple[str, str], Dict[str, str]] = {}
     for ref, fp in pcb_data.footprints.items():
-        if fp.dnp or len(fp.pads) != 2:
+        if fp.dnp:
             continue
-        n1, n2 = fp.pads[0].net_id, fp.pads[1].net_id
+        pads = non_aperture_pads(fp)
+        if len(pads) != 2:
+            continue
+        n1, n2 = pads[0].net_id, pads[1].net_id
         if not n1 or not n2 or n1 == n2:
             continue
         m1, m2 = net_to_member.get(n1), net_to_member.get(n2)

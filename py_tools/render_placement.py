@@ -322,6 +322,10 @@ def legality_findings(model) -> Dict[str, object]:
            'courtyard_overlap_pairs_refs': [],
            'courtyard_blocking_pairs_refs': [],
            'courtyard_overlap_mm2': 0.0,
+           # #1250: [testpoint, cover, frac, body_source, waiver,
+           # gates_if_moved] -- a test point's pad copper under another
+           # part's drawn body (grade_body_overlap's `testpoint_covered`).
+           'testpoint_covered_refs': [],
            'body_seam': None,
            'body_sources': {},
            'cross_side_stacks': [],
@@ -566,6 +570,12 @@ def legality_findings(model) -> Dict[str, object]:
             # weaker claim than one between two drawn .Fab bodies.
             out['body_seam'] = _g.get('body_seam')
             out['body_sources'] = dict(_g.get('body_sources') or {})
+            # #1250: check_assembly's test-point census, the same function's
+            # output. Absolute here; --gate charges the moved subset only.
+            out['testpoint_covered_refs'] = [
+                [t.testpoint, t.cover, t.frac, t.body_source, t.waiver,
+                 t.gates_if_moved]
+                for t in _g.get('testpoint_covered') or ()]
             # Hang it on the model too: `draw_courtyards` needs it per ref and
             # is called from seven places that have no business learning a new
             # parameter -- the same reason #897 put `intent_waivers` here.
@@ -602,7 +612,55 @@ def legality_findings(model) -> Dict[str, object]:
             # checklist read clean on a board whose census never ran. Record
             # WHY; the sheet and --gate both read this.
             out['courtyard_census_error'] = f'{type(exc).__name__}: {exc}'
+        # #1255: check_assembly's body-to-edge census, the same function,
+        # with the band and the edge claims the --intent declares (none
+        # without one: the derived default, reported and never gated).
+        _it = getattr(model, 'intent_plan', None)
+        _declared = (_it.body_edge_mm() if _it is not None else None)
+        try:
+            from placement.legality import body_edge_band
+            out['body_edge_band'] = body_edge_band(
+                pcb, getattr(model, 'pcb_file', None),
+                threshold_mm=_declared,
+                edge_claim_refs=(_it.edge_claim_refs() if _it is not None
+                                 else ()))
+        except Exception as exc:                             # noqa: BLE001
+            # A declared band that could not be measured fails --gate
+            # closed; an undeclared one stays report-only.
+            out['body_edge_band'] = {'error': f'{type(exc).__name__}: {exc}',
+                                     'gates': _declared is not None}
     model._legality_findings = out
+    return out
+
+
+def edge_band_checklist(band, moves=None) -> Dict[str, object]:
+    """The checklist's `a_body_edge_band` (#1255), from `legality_findings`'
+    `body_edge_band` census: rows `[ref, mm, source]` in the band,
+    `[ref, mm, why]` for the parts listed apart (edge class, marker, an edge
+    the intent declares), and the threshold with its basis. `gates` is True
+    only when the --intent declares `assembly.body_edge_mm`. With --before,
+    `new_in_band` counts the in-band parts that MOVED (`moved_parts`'
+    currency, position and rotation over refs in both boards); None without.
+    """
+    band = band or {'error': 'not measured: the model carries no board'}
+    out = {'threshold_mm': band.get('threshold_mm'),
+           'threshold_basis': band.get('threshold_basis'),
+           'citation': band.get('citation'),
+           'gates': bool(band.get('gates')),
+           'eligible': band.get('eligible'),
+           'measured': band.get('measured'),
+           'in_band': [[r['ref'], r['mm'], r['source']]
+                       for r in band.get('in_band') or ()],
+           'excluded': [[r['ref'], r['mm'], r['why']]
+                        for r in band.get('excluded') or ()],
+           'unmeasured': list(band.get('unmeasured') or ()),
+           'error': band.get('error'),
+           'new_in_band': None, 'new_in_band_refs': None}
+    if moves is not None:
+        mv = {m['reference'] for m in moves}
+        new = [row[0] for row in out['in_band'] if row[0] in mv]
+        out['new_in_band'] = len(new)
+        out['new_in_band_refs'] = new
     return out
 
 
@@ -1998,7 +2056,9 @@ Examples:
                         'b_courtyard_blocking_pairs, on the review sheet, and '
                         'can fail --gate, while check_assembly --intent calls '
                         'the same pair waived. Pass the file you pass '
-                        'check_assembly.')
+                        'check_assembly. Its assembly.body_edge_mm also sets '
+                        'checklist.a_body_edge_band\'s band and makes it fail '
+                        '--gate (#1255).')
     p.add_argument('--review-sheet', metavar='PATH', default=None,
                    help='run-23: ALSO write ONE composite image built for the '
                         'boundary review -- F and B side by side (with the '
@@ -2591,6 +2651,14 @@ def main(argv=None):
                 'keepout_copper_unmeasured': fnd.get('keepout_copper_unmeasured', []),
                 # the --before board's own [[ref, amount]], or None
                 'keepout_copper_before': _ko_before},
+            # #1255: each pad-bearing part's BODY against the real outline at
+            # margin 0 (check_assembly's `body_edge_band`). Not under
+            # a_off_outline: a body 1 mm inside the edge is on the board.
+            # --gate charges it only when the --intent declares
+            # `assembly.body_edge_mm`; the derived default (JLCPCB's
+            # 2.5 mm) is reported and never gates.
+            'a_body_edge_band': edge_band_checklist(
+                fnd.get('body_edge_band'), moves if args.before else None),
             # run-6 key honesty: the old 'b_overlap_pairs' NAME carried
             # the PAD-CLEARANCE channel, and a reader auditing overlap
             # with b_overlap_pairs=[] concluded there was none while two
@@ -2635,6 +2703,13 @@ def main(argv=None):
             #     can see a board graded on silk rather than on drawn bodies.
             'b_body_seam': fnd.get('body_seam'),
             'b_body_sources': fnd.get('body_sources') or {},
+            #   b_testpoint_covered -- #1250: a test point whose pad copper
+            #     lies under another part's drawn body, where no probe can
+            #     reach it. [testpoint, cover, frac, body_source, waiver,
+            #     gates_if_moved] rows, every one; --gate with --before
+            #     charges the rows a moved member made (orangecrab ships
+            #     TP26/TP27 under J4 by design).
+            'b_testpoint_covered': fnd.get('testpoint_covered_refs') or [],
             # None when the census ran. --gate reads it: a render that
             # could not build the census must not report "blocking: none".
             'b_courtyard_census_error': fnd['courtyard_census_error'],
@@ -2769,6 +2844,13 @@ def main(argv=None):
             'c_hole_conflicts':
                 len(doc['checklist']['c_hole_conflicts']),
         }
+        # #1255: a DECLARED body-to-edge band gates; the derived default
+        # never does. Declared and unmeasured fails closed.
+        _eb = doc['checklist']['a_body_edge_band']
+        if _eb['gates']:
+            _fail['a_body_edge_band'] = len(_eb['in_band'])
+            if _eb['error']:
+                _fail['a_body_edge_band(unmeasured)'] = _eb['error']
         # A census that could not be built is a FAILED gate, not a clean
         # one: every courtyard key sits at its empty default and the
         # verdict would otherwise read "a/b/c clear" about a board
@@ -2802,6 +2884,12 @@ def main(argv=None):
                    doc['checklist']['b_courtyard_blocking_pairs']
                    if row[0] in _mv or row[1] in _mv]
             _fail['b_courtyard_blocking_pairs(moved)'] = len(_cb)
+            # #1250: same currency, same reason -- a test point a move left
+            # under another part's body. `gates_if_moved` already drops a
+            # silk-drawn cover and a waived pair.
+            _tp = [row for row in doc['checklist']['b_testpoint_covered']
+                   if row[5] and (row[0] in _mv or row[1] in _mv)]
+            _fail['b_testpoint_covered(moved)'] = len(_tp)
         # THE DEFECT RECORDS, read rather than merely written. A gate on
         # a render made from --defect-json is asking "does this picture
         # show the finding", and there are three ways it does not:

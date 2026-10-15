@@ -216,9 +216,10 @@ ROWS = [
      (CEN,), 'KILLED'),
 
     # An assembly block that declares nothing grades nothing -- the #710
-    # failure one level down.
+    # failure one level down. RE-ANCHORED for #1255, whose `body_edge_mm`
+    # is the block's second way to declare something.
     ('an-assembly-block-with-no-sides-loads', 'fp',
-     "    elif assembly:\n",
+     "    elif assembly and 'body_edge_mm' not in assembly:\n",
      "    elif False:\n",
      (CEN,), 'KILLED'),
 
@@ -236,11 +237,11 @@ ROWS = [
     # unchanged in kind -- fail to move the reader when a declarable field
     # arrives -- so it reverts 4 to the version before this key, exactly as it
     # used to revert 3 to the version before `assembly.sides`.
-    # ...and again for #959 (#1000), 5 -> 6, for #1051, 6 -> 7, and for
-    # #1142, 7 -> 8.
+    # ...and again for #959 (#1000), 5 -> 6, for #1051, 6 -> 7, for
+    # #1142, 7 -> 8, and for #1255, 8 -> 9.
     ('the-reader-version-does-not-move', 'fp',
+     "READER_VERSION = 9\n",
      "READER_VERSION = 8\n",
-     "READER_VERSION = 7\n",
      (CEN,), 'KILLED'),
 
     # ------------------------------------------------------- the arithmetic

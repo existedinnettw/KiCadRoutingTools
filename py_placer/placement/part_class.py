@@ -51,7 +51,39 @@ from typing import Dict, Optional, Tuple
 CONNECTOR_FP = ('connector', 'usb', 'hdmi', 'rj45', 'jack', 'pinheader',
                 'pinsocket', 'terminal', 'dsub', 'molex', 'jst', 'hirose',
                 'microsd', 'sim', 'card', 'banana', 'header', 'socket')
-MOUNT_FP = ('mountinghole', 'fiducial', 'testpoint')
+#: Marker parts by footprint-name SUBSTRING. Mounting holes are NOT here:
+#: a substring also matched KiCad's horizontal D-subs
+#: (`..._MountingHolesOffset...`, #1176), so a hole is decided by
+#: `is_mount_hole_name` (the item name) and nowhere else.
+MOUNT_FP = ('fiducial', 'testpoint')
+
+#: `MountingHole` anywhere in the item, except as the plural `MountingHoles`
+#: -- the word a part that merely HAS holes uses (a D-sub's
+#: `MountingHolesOffset`, a module's `WithMountingHoles`).
+_MOUNT_HOLE_MID = re.compile(r'mountinghole(?!s)')
+
+
+def is_mount_hole_name(name) -> bool:
+    """True when a footprint's ITEM name says it is a mounting hole (#1176).
+
+    The item name STARTS with `MountingHole`, in any library
+    (`MountingHole:`, `Mounting_Holes:`, `Glasgow:`, a house library), or
+    carries the singular `MountingHole` later on (`M3_MountingHole_Pad`). The
+    plural does not count: KiCad's horizontal D-subs carry the hole offset in
+    their name (`DSUB-9_Female_Horizontal_..._Housed_
+    MountingHolesOffset9.12mm`), its modules and encoders say
+    `WithMountingHoles` / `CircularMountingHoles`, and a substring test read
+    them all as holes, so a D-sub's edge claim was never emitted. A hole
+    named otherwise (`JLCPCB:AssemblyToolingHole`, `Plain_Hole_3mm`) is
+    NPTH-only and classifies `mount_hole` through `classify_part`'s
+    structural rule. The item, not `lib:item`, because the text parser keeps
+    the library prefix and the pcbnew path does not -- a rule on the whole
+    string would answer differently on the two fronts. So a house library
+    NAMED MountingHole whose item is not (`MountingHole:2.5mm`) is not a hole
+    by name; an NPTH-only one is still caught by the structural rule."""
+    item = str(name or '').rsplit(':', 1)[-1].lower()
+    return (item.startswith('mountinghole')
+            or _MOUNT_HOLE_MID.search(item) is not None)
 
 # The edge-mating subset of CONNECTOR_FP, plus receptacle-only names. A part
 # matching these mates through the board edge / an enclosure aperture.
@@ -125,7 +157,7 @@ def classify_part(fp, ref: str) -> PartClass:
                      if getattr(p, 'pad_type', '') != 'np_thru_hole']
     if npth and not plated_or_smd:
         return PartClass('mount_hole', 'high', ('npth-only pad set',))
-    if 'mountinghole' in name:
+    if is_mount_hole_name(name):
         return PartClass('mount_hole', 'medium', ('footprint name',))
     if 'fiducial' in name or pref == 'FID':
         return PartClass('fiducial', 'medium', ('footprint name/prefix',))

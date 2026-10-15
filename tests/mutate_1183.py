@@ -57,9 +57,10 @@ ROWS = [
      "    if args.baseline is not None and not os.path.isfile(args.baseline):",
      "    if False:",
      (T1183,), 'KILLED'),
+    # RE-ANCHORED for #1250, which appended `testpoint_covered_gating`.
     ('the-gate-is-not-live', 'bs',
-     "                           'pin_in_courtyard', 'courtyard_blocking_gating')",
-     "                           'pin_in_courtyard')",
+     "                           'pin_in_courtyard', 'courtyard_blocking_gating',",
+     "                           'pin_in_courtyard',",
      (T918,), 'KILLED'),
     ('converge-forgets-the-flag', 'cv',
      "                  'assembly.courtyard_gating': '--baseline'}",
@@ -94,9 +95,11 @@ ROWS = [
      "        a.baseline = os.path.abspath(a.baseline)",
      "        a.baseline = a.baseline",
      (T1183,), 'KILLED'),
+    # RE-ANCHORED for #1250, whose sentence about the ninth conjunct
+    # re-wrapped the reason.
     ('the-reason-does-not-say-how', 'bs',
-     "                     'board this one was derived from> to arm it (#1183)'),",
-     "                     'board this one was derived from>'),",
+     "                     '--baseline <the board this one was derived from> to arm '",
+     "                     '--baseline <the board this one was derived from> '",
      (T1183,), 'KILLED'),
     # ---- the verifier on 8492b3c1 -----------------------------------------
     ('the-gate-listed-only-when-assembly-ran', 'bs',

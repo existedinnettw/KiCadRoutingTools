@@ -168,7 +168,8 @@ KEY_SETS = {
     # #837: the board-level assembly policy. `sides` is the claim; `why`
     # records how it was reached, and `emit_intent` fills it with the
     # observation rather than a reason nobody gave.
-    '_ASSEMBLY_KEYS': {'sides', 'why', 'context'},
+    # #1255: `body_edge_mm`, the assembler's least body-to-edge distance.
+    '_ASSEMBLY_KEYS': {'sides', 'why', 'context', 'body_edge_mm'},
     # #902: one declared claim -- these two named parts, no further apart
     # than `max_mm`. `ref` is a single ref here; the brief's list form is
     # sugar that `compile_brief` expands before it reaches this schema.
@@ -318,6 +319,7 @@ def test_an_intent_using_every_known_key_loads():
         'overlap_waivers': [{'pair': ['U1', 'U2'], 'reason': 'net tie',
                              'context': {'why': 'w'}}],
         'assembly': {'sides': 'F', 'why': 'one reflow pass',
+                     'body_edge_mm': 2.5,
                      'context': {'quoted': 'the fab'}},
         # #959. `rules` is EMPTY here on purpose: this intent arms every
         # rule, and a disposition for an armed rule is refused at load.

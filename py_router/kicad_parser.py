@@ -607,6 +607,24 @@ class Zone:
     in_footprint: bool = False  # #478: zone is owned by a footprint (nested in its
     # (footprint ...) block). Points are still BOARD coordinates. Consumers treat it
     # as normal copper/keep-out; plane creation must not replace or abort on it.
+    teardrop: bool = False  # #1164: KiCad's (attr (teardrop ...)) -- a GENERATED
+    # teardrop area where a track meets a pad or via. Routing output, like a
+    # track: KiCad regenerates it on refill, and it sits on its pad's old pose.
+
+
+def pour_zones(zones):
+    """Every zone but KiCad's generated TEARDROP areas: the zones that say
+    "this net POURS here".
+
+    A teardrop (`Zone.teardrop`) is real copper, and the obstacle map, DRC and
+    connectivity keep reading it through `pcb.zones`. But it is routing output
+    on whatever net the track carries, not a pour, so a consumer deciding "is
+    this net a plane / poured net" must ask this instead: counted as a pour, a
+    teardropped signal net read as a plane net (never rip-eligible, skipped
+    by --force-reroute, handed to the plane finalize), and a GND teardrop on
+    F.Cu read as "GND already pours on F.Cu", so route_planes kept the pour it
+    was asked to create."""
+    return [z for z in (zones or ()) if not getattr(z, 'teardrop', False)]
 
 
 @dataclass
@@ -5842,6 +5860,10 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
         zone_clearance_val = float(zcl_match.group(1)) if zcl_match else None
         mth_match = re.search(r'\(min_thickness\s+([\d.]+)\)', zone_header)
         zone_min_th = float(mth_match.group(1)) if mth_match else None
+        # #1164: a teardrop area is (attr (teardrop (type padvia|track_end)))
+        # in the header. A pad's own `(teardrops ...)` settings never reach a
+        # zone block.
+        is_teardrop = re.search(r'\(attr\s*\(teardrop[\s)]', zone_header) is not None
 
         # Extract polygon points - find (pts ...) and extract xy coordinates
         pts_start = zone_content.find('(pts')
@@ -5899,7 +5921,8 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
                 island_area_min=island_area_min,
                 clearance=zone_clearance_val,
                 min_thickness=zone_min_th,
-                in_footprint=in_footprint
+                in_footprint=in_footprint,
+                teardrop=is_teardrop
             ))
 
     return zones
@@ -8179,6 +8202,11 @@ def _extract_zones_from_pcbnew(board, to_mm, get_layer_name):
                 _mth = to_mm(zone.GetMinThickness())
             except Exception:
                 _mth = None
+            # #1164: the text parser's (attr (teardrop ...)); pcbnew 8+.
+            try:
+                _td = bool(zone.IsTeardropArea())
+            except Exception:
+                _td = False
             for zl in zone_layers:
                 zones.append(Zone(
                     net_id=net_id,
@@ -8190,7 +8218,8 @@ def _extract_zones_from_pcbnew(board, to_mm, get_layer_name):
                     island_area_min=island_area_min,
                     clearance=_zcl,
                     min_thickness=_mth,
-                    in_footprint=_in_fp
+                    in_footprint=_in_fp,
+                    teardrop=_td
                 ))
     except Exception:
         pass

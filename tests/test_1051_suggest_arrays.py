@@ -731,12 +731,14 @@ def test_host_floor_and_cascade_on_splitflap():
 
 def test_decline_wording():
     """Fix-round 2, item 7: the reason names the classifier, not a noun
-    the part is not (coldfire's DB9s read 'a mount_hole part')."""
+    the part is not (coldfire's DB9s read 'a mount_hole part'). Since #1176
+    the classifier reads them as what they are -- edge receptacles; before
+    it their `..._MountingHolesOffset...` name made them mount holes."""
     dec = []
     arr.suggest_arrays(_pcb(COLDFIRE), declined=dec)
     db9 = [d for d in dec if 'UARTCAN201' in d['members']]
     assert db9 and db9[0]['why'].startswith(
-        'part_class classifies it mount_hole'), db9
+        'part_class classifies it edge_receptacle'), db9
     print("  PASS: the DB9 decline names part_class's verdict")
 
 

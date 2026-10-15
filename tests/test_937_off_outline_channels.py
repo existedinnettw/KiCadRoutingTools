@@ -107,15 +107,19 @@ def t_the_verdict_does_not_move():
             verdicts[name] = (doc.get('verdict'), r.returncode)
     nb = sorted(n for n, (v, _c) in verdicts.items() if v != 'buildable '
                 '(blocking 0)')
-    assert nb == ['rp2350_fpga_eensy_prePlane'], (
+    # EMPTY since #1204. rp2350 used to be the one entry, and never for an
+    # off-outline reason: its only conjunct was COINCIDENT ORIGINS -- J2 (a
+    # Tag-Connect TC2030-NL on B.Cu) and U3 (a SOT-666 on F.Cu) share one
+    # origin by design with no copper, hole or body in common on a face both
+    # occupy, which #1204 stopped reading as a stack.
+    assert nb == [], (
         f'the NOT BUILDABLE set moved to {nb}. Only the per-pad channel GATING '
         f'subset is a not_buildable conjunct (#1096), and it must flip '
         f'no human reference board -- a change that does is a decision to '
         f'argue for here.')
     for name, (_v, code) in verdicts.items():
         assert code in (0, 4), f'{name} exited {code}'
-    print(f'  PASS: {len(verdicts)} boards, 1 NOT BUILDABLE '
-          f'({nb[0]}), unchanged')
+    print(f'  PASS: {len(verdicts)} boards, none NOT BUILDABLE, unchanged')
 
 
 def t_the_two_implementations_agree():

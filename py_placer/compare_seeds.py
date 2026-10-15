@@ -14,8 +14,19 @@ intent -- a seed failing its gate is recorded but never ranked) -> one
 full-board probe via converge.probe_route, every seed routed with the SAME
 net patterns and the SAME route args and with NO timeout (#713: a verdict a
 clock erased was dropped from the ranking, not ranked worse). A seed that
-produces no verdict carries a `status` naming why. Output: a ranked table, seeds.json in
---out-dir, and a JSON_SUMMARY line with best_seed.
+produces no verdict carries a `status` naming why. Seeds rank by probe
+failures, then -- when failures tie -- probe vias, then probe copper_mm
+(#1191: CLAUDE.md's tie-break; board_score's own copper measure, read off
+the routed probe board), then router iterations.
+
+A seed whose ONLY gate failure is decap rules (`decap_distance` /
+`decap_pin_distance`, nothing unseated, no copper conflict seeded) goes
+through the SEED-THEN-REPAIR arm (#1191): `place_seed --repair
+--repair-decaps` writes seed_N_repaired.kicad_pcb, and when that passes the
+same gate it is the board probed and ranked (gate `rep`). On a pile whose
+intent arms the decap rule that is every seed, which used to leave nothing
+rankable. Output: a ranked table, seeds.json in --out-dir, and a
+JSON_SUMMARY line with best_seed and best_board.
 
     python compare_seeds.py board.kicad_pcb --intent floorplan.json \\
         --seeds 0 1 2 --out-dir seedcmp --ignore-nets GND VCC
@@ -138,11 +149,103 @@ def probe_nets(ignore_nets):
 
 def probe_full(board, nets, route_args):
     """One full-board probe route (`converge.probe_route`, no timeout --
-    #713). Shared with rank_rotations.py (#1113)."""
+    #713). Shared with rank_rotations.py (#1113).
+
+    #1191: also `copper_mm`, board_score's own `quality()` read off the
+    routed probe board (ROUTED copper; footprint graphic copper excluded),
+    because once failures tie the tie-break is vias then copper
+    (CLAUDE.md), and route.py's summary carries vias but no length. One
+    parse of a board the probe already wrote; None when there is no verdict.
+    """
+    import tempfile
     from converge import probe_route
-    pr = probe_route(board, nets, extra_args=route_args or [])
+    out = os.path.join(tempfile.mkdtemp(prefix='probe_full_'),
+                       'routed.kicad_pcb')
+    pr = probe_route(board, nets, extra_args=route_args or [], out=out)
     pr['probe_kind'] = 'full'
+    pr['copper_mm'] = None
+    if pr.get('status') == 'ok' and os.path.isfile(out):
+        from board_score import quality
+        pr['copper_mm'] = quality(out).get('copper_mm')
     return pr
+
+
+def probe_order(pr):
+    """The probe part of a ranking key (#1191): failures, then vias, then
+    copper -- CLAUDE.md's tie-break once blocking ties, and the probe's own
+    numbers. A missing value sorts after any measured one."""
+    big = float('inf')
+    pr = pr or {}
+
+    def _v(k):
+        v = pr.get(k)
+        return big if v is None else v
+    return (_v('failures'), _v('vias'), _v('copper_mm'))
+
+
+def seed_key(row):
+    """A seed row's rank, lower first: clean-gated probed seeds by (failures,
+    vias, copper_mm, iterations, seed); probed-but-gated after them;
+    everything else last, unranked. #1191: vias then copper break a
+    failures tie (CLAUDE.md's tie-break once blocking ties) -- they used to
+    be ignored, so seeds that all routed were ordered by router iterations."""
+    pr = row.get('probe') or {}
+    f = pr.get('failures')
+    return ((0 if (f is not None and not row.get('gated')) else
+             1 if f is not None else 2,)
+            + probe_order(pr)
+            + (pr.get('iterations') or 0, row['seed']))
+
+
+#: The rules `place_seed --repair --repair-decaps` seats a cap FOR -- read
+#: from the seeder, never restated here.
+def _decap_rules():
+    from placement.seeder import DECAP_RUNG_RULES
+    return frozenset(DECAP_RUNG_RULES)
+
+
+def decap_only(summary):
+    """True when a gated seed's ONLY gate failure is decap rules (#1191):
+    its own grade errors are all `decap_distance` / `decap_pin_distance`,
+    and no other gate channel fired (no part unseated, no pad or hole
+    conflict seeded, no keep-out copper, no pad copper left past the outline
+    (#1241), no fixed pose refused). That is the
+    failure `place_seed --repair --repair-decaps` exists for. The channels
+    are place_seed's `gate_reason` inputs as its summary publishes them, and
+    the fixed-pose one is its own `fixed_pose_reason`."""
+    from place_seed import fixed_pose_reason
+    rules = summary.get('grade_error_rules') or {}
+    return (bool(rules) and set(rules) <= _decap_rules()
+            and not summary.get('unseated')
+            and not summary.get('pad_conflicts_seeded')
+            and not (summary.get('hole_conflicts_added') or 0) > 0
+            and not summary.get('keepout_copper_seeded')
+            and not summary.get('pad_copper_off_board_seeded')
+            and not summary.get('pad_copper_off_board_locked')
+            and fixed_pose_reason(summary) is None)
+
+
+def run_decap_repair(seed_board, intent, out_board, *, ignore_nets=None,
+                     seed_args=()):
+    """`place_seed --repair --repair-decaps` on a seed: `(CompletedProcess,
+    JSON_SUMMARY dict)`. The seed's own args ride along (its clearance is
+    the grade's), except `--force`, which --repair refuses."""
+    argv = [sys.executable, '-X', 'utf8',
+            os.path.join(ROOT, 'py_placer', 'place_seed.py'), seed_board,
+            out_board, '--intent', intent, '--repair', '--repair-decaps']
+    if ignore_nets:
+        argv += ['--ignore-nets'] + list(ignore_nets)
+    argv += [a for a in (seed_args or ()) if a != '--force']
+    r = subprocess.run(argv, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', cwd=ROOT)
+    summary = {}
+    for line in r.stdout.splitlines():
+        if line.startswith('JSON_SUMMARY:'):
+            try:
+                summary = json.loads(line.split(':', 1)[1])
+            except ValueError:
+                pass
+    return r, summary
 
 
 def main():
@@ -186,6 +289,7 @@ def main():
         row = {'seed': seed, 'board': out_board,
                'place_seed_rc': r.returncode,
                'grade_errors': s.get('grade_errors'),
+               'grade_error_rules': s.get('grade_error_rules'),
                'unseated': s.get('unseated'),
                'crossings': s.get('crossings'), 'hpwl': s.get('hpwl'),
                'probe': None}
@@ -196,6 +300,37 @@ def main():
             rows.append(row)
             continue
         row['gated'] = (r.returncode == 4)
+        if row['gated'] and decap_only(s):
+            # #1191: the SEED-THEN-REPAIR arm. A seed whose only gate failure
+            # is decap rules is what `--repair --repair-decaps` is for, and on
+            # a pile whose intent arms them (`--decap-claim-after-ics`) it is
+            # every seed: StickHub 2-7 all gated, nothing rankable, exit 4,
+            # while seed 4 repaired to grade_errors 0 in 23 s. Rank the
+            # REPAIRED board -- the one you would keep -- and only when the
+            # repair passes the same gate (its exit 0).
+            fixed = os.path.join(args.out_dir,
+                                 f'seed_{seed}_repaired.kicad_pcb')
+            print(f"[seed {seed}] fails its intent gate on decap rules only "
+                  f"({s.get('grade_error_rules')}) -- place_seed --repair "
+                  f"--repair-decaps -> {os.path.basename(fixed)}")
+            rr, rs = run_decap_repair(out_board, args.intent, fixed,
+                                      ignore_nets=args.ignore_nets,
+                                      seed_args=args.seed_args)
+            row['repair'] = {'board': fixed, 'rc': rr.returncode,
+                             'grade_errors': rs.get('grade_errors'),
+                             'grade_error_rules': rs.get('grade_error_rules'),
+                             'unresolved_by_rule': rs.get('unresolved_by_rule'),
+                             'moved_refs': rs.get('moved_refs'),
+                             'max_move_mm': rs.get('max_move_mm')}
+            if rr.returncode == 0 and os.path.isfile(fixed):
+                row.update(board=fixed, gated=False, repaired=True)
+                print(f"[seed {seed}] repaired: grade errors "
+                      f"{s.get('grade_errors')} -> {rs.get('grade_errors')}, "
+                      f"moved {rs.get('moved_refs')}")
+            else:
+                print(f"[seed {seed}] the decap repair did not clear the gate "
+                      f"(rc={rr.returncode}, unresolved "
+                      f"{rs.get('unresolved_by_rule')})")
         if row['gated']:
             print(f"[seed {seed}] fails its intent gate "
                   f"({s.get('grade_errors')} error(s), "
@@ -218,28 +353,24 @@ def main():
                   f"({row['probe']['note']})")
         rows.append(row)
 
-    # Rank: clean-gated probed seeds first by (failures, iterations, seed);
-    # probed-but-gated after them; everything else last, unranked.
-    def _key(row):
-        pr = row.get('probe') or {}
-        f = pr.get('failures')
-        return (0 if (f is not None and not row.get('gated')) else
-                1 if f is not None else 2,
-                f if f is not None else 1 << 30,
-                pr.get('iterations') or 0,
-                row['seed'])
-
-    ranked = sorted(rows, key=_key)
-    print("\nseed  gate   failures  iterations  crossings  hpwl")
+    ranked = sorted(rows, key=seed_key)
+    print("\nseed  gate   failures  vias  copper_mm  iterations  crossings  hpwl")
     for row in ranked:
         pr = row.get('probe') or {}
         gate = ('FAIL' if row.get('gated') else
+                'rep' if row.get('repaired') else
                 'ok' if row.get('place_seed_rc') == 0 else 'ERR')
         print(f"{row['seed']:>4}  {gate:<5}  "
               f"{str(pr.get('failures', '-')):>8}  "
+              f"{str(pr.get('vias', '-')):>4}  "
+              f"{str(pr.get('copper_mm', '-')):>9}  "
               f"{str(pr.get('iterations', '-')):>10}  "
               f"{str(row.get('crossings', '-')):>9}  "
               f"{str(row.get('hpwl', '-')):>8}")
+    if any(r.get('repaired') for r in rows):
+        print("(gate `rep`: seeded, then repaired by place_seed --repair "
+              "--repair-decaps; probed on the repaired board, crossings/hpwl "
+              "are the seed's)")
 
     best = next((r for r in ranked
                  if (r.get('probe') or {}).get('failures') is not None
@@ -256,9 +387,15 @@ def main():
     print("JSON_SUMMARY: " + json.dumps({
         'seeds': len(args.seeds), 'probed': sum(1 for r in rows if r['probe']),
         'gated': sum(1 for r in rows if r.get('gated')),
+        'repaired': sum(1 for r in rows if r.get('repaired')),
         'best_seed': best['seed'] if best else None,
+        'best_board': best['board'] if best else None,
         'best_failures': ((best.get('probe') or {}).get('failures')
                           if best else None),
+        'best_vias': ((best.get('probe') or {}).get('vias')
+                      if best else None),
+        'best_copper_mm': ((best.get('probe') or {}).get('copper_mm')
+                           if best else None),
         'out_dir': args.out_dir}, sort_keys=True))
     if best is not None:
         return 0
@@ -271,8 +408,26 @@ def main():
               file=sys.stderr)
         return 4
     if rows and all(r.get('gated') for r in rows):
-        print("compare_seeds: every seed failed its intent gate -- nothing "
-              "rankable. Fix the intent or the pile first.", file=sys.stderr)
+        tried = [r for r in rows if r.get('repair')]
+        if tried and len(tried) == len(rows):
+            # #1191: every seed failed on decap rules alone, and the repair
+            # arm already ran the tool for that. Say what it left, not
+            # "fix the intent", which reads as "the intent is wrong".
+            print("compare_seeds: every seed failed its intent gate on decap "
+                  "rules only, and `place_seed --repair --repair-decaps` did "
+                  "not clear them -- nothing rankable. Still unresolved: "
+                  + '; '.join(f"seed {r['seed']}: "
+                              f"{r['repair'].get('unresolved_by_rule')}"
+                              for r in tried[:6])
+                  + ". Seat those caps by hand (place_pose.py), or loosen "
+                    "the decap limits the intent declares.", file=sys.stderr)
+        else:
+            print("compare_seeds: every seed failed its intent gate -- "
+                  "nothing rankable"
+                  + (f" ({len(tried)} failed on decap rules only and were "
+                     f"not cleared by place_seed --repair --repair-decaps)"
+                     if tried else '')
+                  + ". Fix the intent or the pile first.", file=sys.stderr)
         return 4
     # `no winner` is `nothing rankable`, full stop (#713 item 2). The old form
     # was `4 if not any(r['probe'])`, and a no-verdict row is a truthy dict --

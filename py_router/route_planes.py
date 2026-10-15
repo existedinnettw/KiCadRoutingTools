@@ -3229,8 +3229,10 @@ def create_plane(
     # none after), so trust it alone. Only fall back to the file when no caller
     # supplied board state -- i.e. the CLI, where the file IS the board.
     existing_zones = []
+    from kicad_parser import pour_zones
     if _live_pcb_data:
-        for z in (getattr(pcb_data, 'zones', None) or []):
+        # POURS only (#1164), as plane_io.extract_zones reads the file.
+        for z in pour_zones(getattr(pcb_data, 'zones', None)):
             existing_zones.append(ZoneInfo(net_id=z.net_id, net_name=z.net_name, layer=z.layer,
                                            in_footprint=getattr(z, 'in_footprint', False),
                                            priority=int(getattr(z, 'priority', 0) or 0)))
@@ -3240,7 +3242,7 @@ def create_plane(
         except (FileNotFoundError, OSError):
             existing_zones = []
         seen_keys = {(z.net_name, z.layer) for z in existing_zones}
-        for z in (getattr(pcb_data, 'zones', None) or []):
+        for z in pour_zones(getattr(pcb_data, 'zones', None)):
             key = (z.net_name, z.layer)
             if key in seen_keys:
                 continue

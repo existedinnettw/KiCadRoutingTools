@@ -426,8 +426,9 @@ def test_the_loader_refuses_every_malformed_along_edge_claim():
     # 6 since #959 (#1000): `edge_connectors[].side`, the connector's face.
     # 7 since #1051/#1052/#1054: `arrays[]`, `fixed_poses[]`,
     # `blocks[].rigid`. 8 since #1142: `decaps.within_radius_refs` and
-    # `decaps.within_radius_mm`, the caps a reference holds.
-    assert fp.READER_VERSION == 8, (
+    # `decaps.within_radius_mm`, the caps a reference holds. 9 since #1255:
+    # `assembly.body_edge_mm`, the assembler's body-to-edge band.
+    assert fp.READER_VERSION == 9, (
         f"{fp.READER_VERSION}: the field vocabulary grew. Re-state this "
         f"literal and say which field arrived, the way #712, #837, #902, "
         f"#893, #959 and #1051 did")

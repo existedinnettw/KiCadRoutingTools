@@ -65,7 +65,12 @@ def extract_zones(pcb_file: str) -> List[ZoneInfo]:
     from kicad_parser import extract_zones as _parser_extract_zones
     from kicad_parser import extract_nets, detect_kicad_version
     _, name_to_id = extract_nets(content, detect_kicad_version(content))
-    parsed = list(_parser_extract_zones(content, name_to_id))
+    from kicad_parser import pour_zones
+    # POURS only: a teardrop (#1164) is routing output, so a GND teardrop on
+    # F.Cu must not read as "GND already pours on F.Cu" (route_planes kept
+    # the pour it was asked to create) or as an incumbent whose priority a
+    # new plane must outrank.
+    parsed = pour_zones(_parser_extract_zones(content, name_to_id))
 
     # Recover each PHYSICAL pour's full layer span: the reader emits one Zone per
     # copper layer, and the entries of a multi-layer `(layers ...)` pour share a

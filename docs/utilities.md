@@ -174,7 +174,11 @@ python py_placer/place_pose.py BOARD OUT set U1 129.9 98.3 rotate CON2 180 lock 
 
 Several verbs in one call describe ONE arrangement: every op is resolved
 against the INPUT board and written in a single pass, so no op sees another's
-effect. `set` takes exact coordinates positionally; `--near X Y` is the same
+effect, and the arrangement is graded at the exact points given -- so a snap
+needs a call with ONE pose op: `--near` beside a second pose op is refused at
+exit 2 before anything is graded (#1194; issue one `set REF --near X Y` per
+call, lock/unlock may ride along), and `--snap` there is skipped and says so.
+`set` takes exact coordinates positionally; `--near X Y` is the same
 point read as approximate and implies `--snap`, which takes the best legal
 pose within `--radius` (ranked by `pose_score`, then RE-GRADED here — the
 ranker's legality is an AABB gate and this verb's verdict is exact geometry,
@@ -231,6 +235,13 @@ in this verb's own currency before it is written. Measured on
 `set C4 --near 128.0 49.53 --radius 3`, because its gate is the absolute one,
 while 236 poses inside the same radius graded no worse — the nearest 0.354 mm
 away. `snap_census` reports both rungs and `snapped.rung` says which answered.
+When every candidate fails the re-grade, the refusal says what the census
+found instead (#1209) -- `regrade_refused_by` / `regrade_refused_pairs` per
+category, e.g. `hole_conflicts x4 (H1/TP1)` -- plus the `untried` count
+(raise `--snap-tries`) and the ranker's nearest pose past the bound
+(`nearest_beyond_radius`, raise `--radius`). It never offers back a pose its
+own re-grade refused, and never advises `--snap` to a call that snapped:
+`nearest_legal` on a snap is the pose it wrote, or null.
 
 Knobs come from the board (`list_nets.board_floor_knobs`) unless given — a
 CLI-supplied `--clearance` loosens the verdict on a tool whose job is to
@@ -259,8 +270,16 @@ python py_placer/compare_seeds.py board.kicad_pcb --intent floorplan.json \
 
 Per seed: a `place_seed` run (a seed failing its own intent gate is
 recorded but never ranked), then a probe of `'*'` minus the ignored nets
-with identical route args. Emits a ranked table, `seeds.json`, and a
-`JSON_SUMMARY` with `best_seed`. Exit 0 with a ranked winner, 4 when
+with identical route args. Seeds rank by probe failures, then, when failures
+tie, by the probe's vias, then its `copper_mm` (board_score's routed-copper
+measure, read off the routed probe board), then router iterations (#1191).
+A seed whose ONLY gate failure is decap rules (`decap_distance` /
+`decap_pin_distance`, with nothing unseated and no copper conflict seeded)
+is repaired with `place_seed --repair --repair-decaps` into
+`seed_N_repaired.kicad_pcb`. When the repaired board passes the same gate,
+that board is probed and ranked (gate `rep`, row `repair`), so a pile whose
+intent arms the decap rule is rankable. Emits a ranked table, `seeds.json`,
+and a `JSON_SUMMARY` with `best_seed` and `best_board`. Exit 0 with a ranked winner, 4 when
 nothing was rankable -- including when every probe ran but produced no
 verdict, which returned 0 with `best_seed: null` until #713 fixed it.
 When `place_seed` refuses the zone PLAN (its exit 5, #959), the plan is the
@@ -319,8 +338,9 @@ left unseated, or written at another angle, is a hard fail and ranks last. An
 angle where a seed's re-seat could not put the part back (`reseat_declined`,
 #1117) ranks after every angle whose seeds held it, and still ranks. The
 rest rank by unseated parts, then a probe verdict when `--probe` routed it
-(the top `--probe-top` angles, full-board, no timeout), then median crossings,
-hpwl and grade errors; a tie goes to the earlier angle in the ladder (the
+(the top `--probe-top` angles, full-board, no timeout) -- median failures,
+then median probe vias, then median probe `copper_mm` (#1191) -- then median
+crossings, hpwl and grade errors; a tie goes to the earlier angle in the ladder (the
 input angle when it is ranked). Any other seed that fails its intent gate is
 not a tier -- on a pile most do, for repairable reasons -- but each angle reports
 how many of its seeds did, and the winner line says so. A CONTROL arm seeds
@@ -369,7 +389,7 @@ python py_placer/plane_score.py board.kicad_pcb --plane-nets GND 3V3:F.Cu
 
 ## Placement Quality Terms (`placement_score.py`)
 
-Five terms a COPPER-FREE placement lap can be ranked by, because nothing else
+Six terms a COPPER-FREE placement lap can be ranked by, because nothing else
 can rank one: `blocking` on such a board is the unrouted count (the routing
 half's number, identical on every lap) and `quality` is `(0, 0.0, 0)` for every
 placement of every board.
@@ -377,15 +397,17 @@ placement of every board.
 ```bash
 python3 -X utf8 py_placer/placement_score.py board.kicad_pcb --json wk/terms.json
 python3 -X utf8 py_placer/placement_score.py board.kicad_pcb --intent floorplan.json
+python3 -X utf8 py_placer/placement_score.py board.kicad_pcb --length-groups groups.json
 ```
 
 | term | what it measures |
 |---|---|
-| `pair_length` | worst straight-line span of a declared differential pair, mm |
+| `pair_length` | worst span of a declared differential pair, mm. A pair two parts carry whole: the straight pad-centre span. A pair through per-leg series parts (AC caps, USB series resistors), composed by the router's own junction rule (`diff_xnet.find_ac_coupled_xnets`): the longer leg's pad-centre polyline through the series pads, with both legs and \|P−N\| in `pairs[]` as numbers, not a verdict (#1251). A pair neither covers is named in `not_measured` with why; the `basis` names the rule and the measured rows |
 | `pin_order_crossings` | part pairs whose pad order CROSSES, so a router must pay a via or a detour |
 | `cluster_to_pin` | worst distance from a passive to the pin it serves, mm — declared `proximity` claims first, the decap election for the rest |
 | `plane_cut_proxy` | length of each net's chord lying INSIDE a locked part's body, summed. Two-layer boards only; ground and rails excluded |
 | `balance` | pad-area first moment along the board's long axis, as a fraction of span. Copper pads only: NPTH and paste/mask-aperture pads are excluded, and the term names that population as its `basis` (#1143), so a lap scored before #1143 is reported `not-comparable` against one scored after it rather than as a move |
+| `edge_facing` | connected pads on a row that faces the board outline with nothing beyond it, over parts with 3+ connected pads; edge connectors excluded |
 
 **There is no aggregate and no weight.** Laps are compared by `compare_terms`,
 which is PARETO: `better` only when no measured term regressed, `mixed` naming
@@ -396,6 +418,23 @@ Each term publishes a `basis` when its population is not fixed by the board
 (which parts are locked, which claims were declared). When that basis moves
 between laps the term is **not judged**: a total over a different population is
 not a larger or smaller version of the first.
+
+**`--length-groups FILE`** (the `board_score` / `check_complete` format,
+`{"G": {"nets": [...], "tolerance_mm": t, "mode": "pin_pair"}}`) fills a
+REPORT-ONLY `length_groups` section (#1252) that is **not a term**: it is not in
+`TERM_ORDER`, so `compare_terms` and the lap ledger never read it. Per group it
+reports each member's length FLOOR and its basis -- `2-part`, the octilinear
+distance of the closest pad pair across the two parts; `multipoint`, of the
+farthest pad pair on different parts -- the longest floor and its net, the
+spread, `copper_to_add_mm` = Σ(longest − own floor), and the longest floor in
+ps on an outer and an inner layer (`impedance.get_layer_ps_per_mm`).
+`tolerance_mm` is printed beside the spread with no pass/fail: a floor spread
+is not a routed spread, because meanders can always add copper. `cannot_see`
+lists what a floor misses (detours, layers and vias, meander room, fly-by/T
+topologies, pad `die_length` #1248 and pad-edge entry). A group with fewer than
+two of its nets on the board is `ran: false` with a reason; a path that is not
+a readable file of that shape exits 2 (where `board_score` reads it as
+ungraded).
 
 `board_score.py --placement-terms` embeds this document at a top-level
 `placement` key, report-only — it never enters `blocking` and never changes the

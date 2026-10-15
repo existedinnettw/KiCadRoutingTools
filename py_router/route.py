@@ -35,7 +35,7 @@ import time
 import json
 from typing import List, Optional, Tuple, Dict, Set
 
-from kicad_parser import parse_kicad_pcb, PCBData, Pad
+from kicad_parser import parse_kicad_pcb, PCBData, Pad, pour_zones
 from kicad_writer import (
     generate_segment_sexpr, generate_via_sexpr, generate_gr_line_sexpr, generate_gr_text_sexpr,
     swap_segment_nets_at_positions, swap_via_nets_at_positions, swap_pad_nets_in_content,
@@ -2068,7 +2068,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         print("WARNING: --force-reroute requires an explicit --nets scope "
               "(it rips every selected net); ignoring it for this run.")
     elif force_reroute:
-        _fr_zone_nids = {z.net_id for z in pcb_data.zones}
+        _fr_zone_nids = {z.net_id for z in pour_zones(pcb_data.zones)}
         _fr_copper_nids = ({s.net_id for s in pcb_data.segments}
                            | {v.net_id for v in pcb_data.vias})
         _fr_cand, _fr_skipped_plane = [], []
@@ -2170,7 +2170,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             and os.environ.get('KICAD_PLANE_FINALIZE', '1') == '1'):
         from net_queries import matches_net_filter as _mnf1112
         _finalize_zone_nets1112 = sorted({
-            pcb_data.nets[_z.net_id].name for _z in pcb_data.zones
+            pcb_data.nets[_z.net_id].name for _z in pour_zones(pcb_data.zones)
             if _z.net_id in pcb_data.nets and _z.net_id != 0
             and (_z.layer or '').endswith('.Cu')
             and (not net_names
@@ -2485,7 +2485,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     if rip_existing_nets:
         from net_queries import matches_net_filter
         to_route_set = set(all_net_ids_to_route)
-        zone_net_ids = {z.net_id for z in pcb_data.zones}
+        # A TEARDROP zone is routing output on a signal net, not a pour: a
+        # teardropped net stays rip-eligible (`pour_zones`, #1164).
+        zone_net_ids = {z.net_id for z in pour_zones(pcb_data.zones)}
         seg_net_ids = {s.net_id for s in pcb_data.segments}
         for nid in sorted(seg_net_ids):
             if nid == 0 or nid in to_route_set:
@@ -2595,7 +2597,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     relocatable_plane_ids = []
     from tap_relocation import tap_relocation_enabled as _tap_reloc_on
     if _tap_reloc_on():
-        _zone_nids = {z.net_id for z in pcb_data.zones if z.net_id > 0}
+        _zone_nids = {z.net_id for z in pour_zones(pcb_data.zones) if z.net_id > 0}
         relocatable_plane_ids = sorted(
             n for n in _zone_nids
             if n not in all_net_ids_to_route and n not in existing_rippable
@@ -2637,7 +2639,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             else os.environ.get('KICAD_RIP_PREEXISTING', '1') != '0'):
         from net_queries import split_net_patterns, net_pattern_matches
         _pe_to_route = set(all_net_ids_to_route)
-        _pe_zone_nids = {z.net_id for z in pcb_data.zones}
+        _pe_zone_nids = {z.net_id for z in pour_zones(pcb_data.zones)}
         _pe_seen = set(existing_rippable)
         _pe_seg_count: Dict[int, int] = {}
         for _s in pcb_data.segments:
@@ -6326,7 +6328,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     if final_reconcile and not skip_routing and not _ckpt_stop:
         _copper_pre9 = ({s.net_id for s in pcb_data.segments}
                         | {v.net_id for v in pcb_data.vias})
-        _zone_pre9 = {z.net_id for z in (pcb_data.zones or [])}
+        _zone_pre9 = {z.net_id for z in pour_zones(pcb_data.zones)}
         _scope_pre9 = {nid for _n, nid in net_ids}
         _zero_pre9 = sorted(
             net.name for nid, net in pcb_data.nets.items()

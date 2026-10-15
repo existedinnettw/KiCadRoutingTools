@@ -1149,11 +1149,27 @@ with tempfile.TemporaryDirectory() as d:
               (s.get('refused') or '')[-120:])
 
 # ---------------------------------------------------------------------------
-print("--near on a call carrying several ops says it did not apply")
+print("--near on a call carrying several pose ops is refused before grading")
+with tempfile.TemporaryDirectory() as d:
+    # #1194: it used to grade the --near point as EXACT and write or refuse
+    # on that; a usage error now, at parse time, naming both ops.
+    out = os.path.join(d, 'multi_near.kicad_pcb')
+    refuse_check([sys.executable, '-X', 'utf8', POSE, BOARD, out,
+                  'set', 'C3', '--near', str(GOOD['x']), str(GOOD['y']),
+                  'rotate', 'R1', '90', '--force'],
+                 refuse='this call carries 2 (set C3, rotate R1)', code=2)
+    check("and it wrote nothing", not os.path.exists(out))
+    # A lock riding along is not a pose op: the snap still applies.
+    r = run([POSE, BOARD, out, 'set', 'C3', '--near', str(GOOD['x']),
+             str(GOOD['y']), 'lock', 'C3', '--dry-run'])
+    check("--near with a lock riding along is still one pose op",
+          r.returncode == 0, (r.stdout + r.stderr)[-200:])
+
+print("--snap on a call carrying several ops says it did not apply")
 with tempfile.TemporaryDirectory() as d:
     out = os.path.join(d, 'multi2.kicad_pcb')
-    r = run([POSE, BOARD, out, 'set', 'C3', '--near', str(GOOD['x']),
-             str(GOOD['y']), 'rotate', 'R1', '90', '--force'])
+    r = run([POSE, BOARD, out, 'set', 'C3', str(GOOD['x']),
+             str(GOOD['y']), 'rotate', 'R1', '90', '--snap', '--force'])
     check("the run proceeds", r.returncode == 0, (r.stdout + r.stderr)[-200:])
     if r.returncode == 0:
         s = summary(r)

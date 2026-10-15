@@ -693,7 +693,11 @@ def warn_missing_courtyards(refs, label: str = 'placement',
                   f"courtyard are spaced on their drawn body united with "
                   f"their pads (body model: "
                   + ', '.join(f"{n} {s}" for s, n in sorted(mix.items()))
-                  + ")")
+                  + ")"
+                  + ("; a fab_marking is a .Fab pin-1 dot or line, not a "
+                     "body (#1201): those are spaced on the marking united "
+                     "with their pads, as before"
+                     if 'fab_marking' in mix else ''))
         refs = [r for r in refs if r not in drawn]
         if not refs:
             return

@@ -125,7 +125,7 @@ ROWS = [
      (T1108,), 'KILLED'),
     # --- #1109: one pile predicate; the film says when it fell back ---------
     ('pile-misses-a-staging-ring', 'pstate',
-     "        return bool(self.unplaced or sig.get('s3_outside')",
+     "        return bool(self.unplaced or self.off_outline",
      "        return bool(self.unplaced or False",
      (T1109,), 'KILLED'),
     ('film-fallback-not-a-warning', 'film',

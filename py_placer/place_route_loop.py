@@ -18,7 +18,9 @@ fix one net is how placements get destroyed.
 
 The new placement is accepted only if a real re-route improves
 (failures, router iterations), otherwise it is reverted and the next round
-widens the displacement cap.
+widens the displacement cap. A candidate that lays pad copper on another
+part's pad which the incumbent did not have (check_assembly's BLOCKING pad
+stack, a short when the nets differ) is rejected before it is routed (#858).
 
 Usage:
   python place_route_loop.py input.kicad_pcb output.kicad_pcb \
@@ -319,7 +321,8 @@ def metrics_from_summary(summary: dict, log: str = '',
 def write_round_sidecar(work: str, rnd: int, *, board: str, routed: str,
                         parent: str, accepted: bool, screened: bool = False,
                         targets=None, groups=None, moved=None, metrics=None,
-                        diagnosis=None, relocation=None) -> str:
+                        diagnosis=None, relocation=None,
+                        pad_stacks_new=None) -> str:
     """Record one round as `loop_round{N}.json` next to its board (#431).
 
     The boards alone are NOT a chain: a REJECTED loop_round2.kicad_pcb sits
@@ -354,6 +357,10 @@ def write_round_sidecar(work: str, rnd: int, *, board: str, routed: str,
     # sidecar keeps the eleven keys it has always had, byte for byte.
     if diagnosis is not None:
         doc['diagnosis'] = diagnosis
+    # #858: the new pad stacks a round was rejected for, same rule -- written
+    # only on such a round (`new_pad_stacks` rows).
+    if pad_stacks_new:
+        doc['pad_stacks_new'] = pad_stacks_new
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(doc, f, indent=1, sort_keys=True)
@@ -574,6 +581,35 @@ def better(a, b):
     return a['iterations'] < b['iterations'] * 0.95
 
 
+def pad_stack_pairs(pcb_data, clearance: float) -> dict:
+    """`{(a, b): BodyOverlapPair}` -- check_assembly's BLOCKING channel,
+    `legality.pad_intersection_pairs` (#858): two parts' pad copper
+    intersecting on a shared side, a plated through-hole pad on both, ANY
+    net, confirmed on the pads' outlines. Called, not re-implemented, so the
+    loop and check_assembly cannot disagree about a stack."""
+    from placement.legality import pad_intersection_pairs
+    return {(p.a, p.b): p for p in pad_intersection_pairs(pcb_data, clearance)}
+
+
+def new_pad_stacks(incumbent: dict, candidate: dict) -> list:
+    """The pad stacks `candidate` has and `incumbent` does not (#858), as
+    round-sidecar rows `{a, b, area_mm2, side, shorts}` sorted by pair.
+    Both are `pad_stack_pairs` results. NEW only: a stack the incumbent
+    already has is the input's (a designer may overlap two footprints' lands
+    on purpose), and a round that leaves it where it was has not made it.
+
+    The accept criterion's own measure. `better()` and `--accept-cmd` score
+    the ROUTE, and an unrouted short is invisible to both: run 1 of #858 was
+    accepted at failures 96 -> 87 with `U31.6 [TELEM_5V]` on
+    `Y1.3 [/CAN_XTAL2]`. `shorts` names the different-net contacts (up to
+    three per pair, the channel's own); a same-net stack is rejected too,
+    because check_assembly gates it the same way -- two parts' pads in one
+    place cannot both be soldered."""
+    return [{'a': p.a, 'b': p.b, 'area_mm2': p.area_mm2, 'side': p.side,
+             'shorts': list(p.shorts)}
+            for key, p in sorted(candidate.items()) if key not in incumbent]
+
+
 def _ratsnest_screen(before, after, pct):
     """(skip, note) -- should this candidate skip its routing run? (#504)
 
@@ -757,7 +793,13 @@ def main():
                              "max-length rule, a via ban, a required width or a "
                              "decap-proximity limit -- on a spec'd board those are what "
                              "decide whether a placement got better. A non-zero exit or "
-                             "a missing SCORE line REJECTS the round.")
+                             "a missing SCORE line REJECTS the round. --intent never "
+                             "reaches the built-in comparison (it gates the moves "
+                             "only); the repo's judge, py_tools/accept_blocking.py, "
+                             "scores the routed board with board_score, unrouted+"
+                             "broken first, then the rest of blocking, then vias: "
+                             "--accept-cmd \"python3 py_tools/accept_blocking.py "
+                             "--intent INTENT.json\" (#1194)")
     parser.add_argument("--ratsnest-screen", type=float, default=0.0,
                         help="Skip the routing run when a candidate placement's "
                              "airwire crossings or HPWL regress by more than "
@@ -1021,6 +1063,11 @@ def main():
     write_round_sidecar(work, 0, board=cur_file,
                         routed=os.path.join(work, 'loop_round0_routed.kicad_pcb'),
                         parent=None, accepted=True, metrics=best)
+    # #858: the incumbent's pad stacks, so a round is charged only for the
+    # ones IT lays. Advanced with `best` on every accept.
+    incumbent_stacks = pad_stack_pairs(parse_kicad_pcb(cur_file),
+                                       args.clearance)
+    rejected_pad_stacks = 0
     # Kept separately from `best`, which advances on every accept. Without it
     # the run cannot report what it started from, which is half of any delta.
     baseline = dict(best)
@@ -1329,6 +1376,38 @@ def main():
         # accepted), and an accepted round delivered OUT with no project.
         copy_siblings(quench_base, cand_file)
 
+        # #858: a candidate that lays NEW pad copper on another part's pad is
+        # not a placement any route can make buildable, so it is rejected
+        # here -- before the route, whose failures/iterations (and the
+        # --accept-cmd judge) cannot see an unrouted short. Measured on the
+        # written board, after the relocation AND the quench, so neither
+        # engine's own gate is taken on trust.
+        cand_stacks = pad_stack_pairs(parse_kicad_pcb(cand_file),
+                                      args.clearance)
+        stacked = new_pad_stacks(incumbent_stacks, cand_stacks)
+        if stacked:
+            rejected_pad_stacks += 1
+            print(f"  REJECTED before routing: the candidate lays "
+                  f"{len(stacked)} new pad stack(s) on another part's pad "
+                  f"(check_assembly's BLOCKING channel) -- widening the "
+                  f"nudge cap (swap cap stays {swap_cap:.1f}mm).")
+            for s in stacked[:8]:
+                print(f"    {s['a']} x {s['b']}  {s['area_mm2']}mm2"
+                      + (f" side {s['side']}" if s['side'] else '')
+                      + (f"  SHORT {'; '.join(s['shorts'])}"
+                         if s['shorts'] else '  (same net)'))
+            write_round_sidecar(work, rnd, board=cand_file, routed=None,
+                                parent=cur_file, accepted=False,
+                                targets=targets, groups=blocks,
+                                moved=_round_moved(placements),
+                                diagnosis=(diagnosis_to_json(diag)
+                                           if diag is not None else None),
+                                relocation=(reloc.to_dict()
+                                            if reloc is not None else None),
+                                pad_stacks_new=stacked)
+            max_disp *= 1.5
+            continue
+
         metrics = run_route(
             cand_file, os.path.join(work, f'loop_round{rnd}_routed.kicad_pcb'),
             args.route_args, os.path.join(work, f'loop_round{rnd}_route.log'),
@@ -1378,6 +1457,7 @@ def main():
             if args.accept_cmd:
                 best_score = metrics.get('accept_score')
             cur_file = cand_file
+            incumbent_stacks = cand_stacks
             # The relocation first, then the quench over it: the candidate was
             # written from `quench_base` in exactly that order.
             if reloc is not None and not reloc.refusal:
@@ -1400,6 +1480,10 @@ def main():
     if args.ratsnest_screen > 0:
         print(f"Ratsnest screen: {screened} round(s) skipped the routing run"
               f" at {args.ratsnest_screen:g}% regression.")
+    if rejected_pad_stacks:
+        print(f"Pad stacks: {rejected_pad_stacks} round(s) rejected before "
+              f"routing for laying new pad copper on another part's pad "
+              f"(pairs in each loop_round<N>.json `pad_stacks_new`).")
     print(f"Final: failures={best['failures']} iterations={best['iterations']:,}"
           f" vias={best['vias']}")
     print(f"Wrote {args.output_file}")
@@ -1415,6 +1499,9 @@ def main():
         'rounds_run': rounds_run,
         'rounds_accepted': accepted_rounds,
         'rounds_screened': screened,
+        # #858: always present, so 0 reads "checked, none" -- the gate is
+        # not a mode. The pairs are in each rejected round's sidecar.
+        'rounds_rejected_pad_stacks': rejected_pad_stacks,
         'failures_before': baseline['failures'],
         'failures_after': best['failures'],
         'iterations_before': baseline['iterations'],

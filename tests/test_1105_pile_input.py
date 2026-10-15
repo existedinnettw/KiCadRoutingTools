@@ -49,7 +49,11 @@ def test_the_pile_basis_is_a_pile():
         assert st.partially_unplaced or st.unplaced, st.reasons
         assert doc['context']['pose_claims_withheld'], doc['context']
         assert doc['decaps']['max_distance_mm'] is not None, doc['decaps']
-        assert doc['context']['decap_census']['reference_board'] == ESP
+        # #1175: named and identified by its bytes, never pointed at.
+        assert doc['context']['decap_census']['reference_board'] == \
+            os.path.basename(ESP)
+        assert doc['context']['decap_census']['reference_board_sha256'] == \
+            provenance.sha256_file(ESP)
         # mechanical.json (USB1 and the two Ref* markers on esp_prog) reached
         # the intent as fixed poses -- the CLI's job, not emit_intent's
         fixed = {str(f['ref']) for f in intent.fixed_poses}

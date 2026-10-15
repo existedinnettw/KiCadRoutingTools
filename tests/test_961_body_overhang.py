@@ -413,7 +413,9 @@ class Round2(_Boards):
     def test_unusable_fab_does_not_fall_back_to_silk(self):
         path = self.synthetic(
             'fab_open.kicad_pcb',
+            # Open but body-sized: not a marking (#1243), so no fallback.
             '(fp_line (start -1 -1) (end 1 -1) (layer "F.Fab")) '
+            '(fp_line (start 1 -1) (end 1 1) (layer "F.Fab")) '
             '(fp_rect (start -1 -1) (end 1 1) (layer "F.SilkS"))')
         row = ConnectorGeometry(parse_kicad_pcb(str(path)), str(path)).measure(
             'J1', 'west')

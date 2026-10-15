@@ -439,8 +439,11 @@ def test_the_rotation_loop_needs_a_declaration_structurally():
     written down rather than left as an unexplained gap.
 
     It is kept, not dropped, because an interior misplaced connector is
-    exactly the repair case, and nothing in this tree knows which way a
-    mating face must point.
+    exactly the repair case. #1155 taught the seat which way a STRONG mating
+    face points, and such a part now never reaches this loop (it is turned to
+    face its edge, or skips the loop because it already does); a part whose
+    face is weak or absent has no such reading, and for it the declaration is
+    still the only evidence a turn is wanted.
     """
     import inspect
     src = inspect.getsource(seeder._seat_edge)

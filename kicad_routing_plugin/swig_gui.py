@@ -3316,7 +3316,9 @@ class RoutingDialog(wx.Dialog):
 
         # Existing zones in the loaded PCB - skip suggesting these.
         existing_zone_keys = set()
-        for z in getattr(self.pcb_data, 'zones', []) or []:
+        from kicad_parser import pour_zones
+        # POURS only: a teardrop (#1164) is not "this net already pours here".
+        for z in pour_zones(getattr(self.pcb_data, 'zones', None)):
             existing_zone_keys.add((normalize(z.net_name), z.layer))
 
         to_offer = []  # list of (actual_net_name, layer)

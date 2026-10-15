@@ -132,6 +132,11 @@ class _IntentTerm(NamedTuple):
     threshold: float
     anchor: bool              # zone_containment: grade the courtyard CENTRE
     entry: Optional[Dict]     # keepout: the raw entry `keepout_hit` reads
+    # zone_containment (#1174): sides the zone does not bound for this ref --
+    # its declared edge, where the zone ends at the outline. The grade's own
+    # `zone_open_sides`, carried in the zone row, so the gate opens what the
+    # grade opens and nothing else.
+    open_sides: Tuple[str, ...] = ()
 
 
 class _TetherTerm(NamedTuple):
@@ -203,7 +208,8 @@ def build_zone_spec(zones, parts, refs=None
                     for _r in (_p.rot % 360, (_p.rot + 90) % 360))
                 _terms.append(_IntentTerm(
                     'zone_containment', _z['name'], tuple(_z['rect']),
-                    _tol, _anchor, None))
+                    _tol, _anchor, None,
+                    tuple((_z.get('open_sides') or {}).get(_ref, ()))))
             elif _z['exclusive'] and (not _z['side']
                                       or _p.side == _z['side']):
                 # `elif`, not `if`: `rule_zone_exclusive` skips members of the
@@ -334,7 +340,8 @@ def intent_term_values(spec: Tuple[_IntentTerm, ...], rects
             # declines to measure.
             out.append(rect_overlap_area(rects[0], t.rect))
         else:
-            out.append(_fp.zone_escape(t.rect, rects[0], t.anchor)[0])
+            out.append(_fp.zone_escape(t.rect, rects[0], t.anchor,
+                                       t.open_sides)[0])
     return tuple(out)
 
 
@@ -701,6 +708,21 @@ def _count_crossings_within(a: np.ndarray,
     return half, weighted / 2.0
 
 
+#: #1152: WHY a part entered a `QuenchState` locked, as the phrase a refusal
+#: names (`QuenchState.lock_reasons`). `_Part.locked` is one boolean with
+#: several causes, and the seeder's stage 0 named every one of them "locked
+#: in the board file" -- sending the author of a logo's fixed pose to unlock
+#: a board file that locks nothing. Recorded where each lock is applied, the
+#: first cause winning; a part absent from the map entered free.
+LOCK_FILE = 'locked in the board file'
+LOCK_CALLER = 'locked by the caller (--lock or the intent)'
+LOCK_OUTLINE = 'draws the board outline (#829)'
+LOCK_SCOPE = 'outside the move scope'
+LOCK_UNCONNECTED = 'has no connected pin (frozen unless --move-unconnected)'
+LOCK_PADLESS = 'has no pad: a static obstacle by its courtyard'
+LOCK_SEATED_PLUG = 'a PCB-edge plug seated at its edge (#1098)'
+
+
 class _Part:
     __slots__ = ('ref', 'pads_local', 'pin_count', 'bounds_by_rot',
                  'seed_x', 'seed_y', 'x', 'y', 'rot', 'locked',
@@ -1055,12 +1077,15 @@ class QuenchState:
                 if _geom.occupancy_local is not None:
                     body_locals[_ref] = _geom.occupancy_local
                     body_sources[_ref] = _geom.source
-        locked_refs = set(extract_locked_refs(pcb_file))
+        file_locked = set(extract_locked_refs(pcb_file))
+        locked_refs = set(file_locked)
         if extra_locked_refs:
             locked_refs |= extra_locked_refs
         ignore = ignore_net_ids or set()
 
         self.parts: Dict[str, _Part] = {}
+        #: #1152: {ref: LOCK_*} for every part entered locked -- see LOCK_FILE.
+        self.lock_reasons: Dict[str, str] = {}
         no_courtyard = []
         outline_locked = []   # #829, reported below
         for ref, fp in pcb_data.footprints.items():
@@ -1068,11 +1093,10 @@ class QuenchState:
             # reading every pad, deliberately. A part whose only pads are
             # paste/mask apertures (a logo) stays MOVABLE here: the seeder
             # seats such a part by its courtyard when the intent fixes its
-            # pose (test_1051_hardening's copperless logo), and taking it
-            # down this branch would lock it as a static obstacle, which the
-            # fixed-pose stage then refuses as "already placed" (Phase-1
-            # verifier). A truly pad-less footprint is refused that way too,
-            # which is a separate, older question.
+            # pose (test_1051_hardening's copperless logo). A truly pad-less
+            # footprint is locked below, under LOCK_PADLESS, which the
+            # seeder's stage 0 reads as a policy and not a pose: it seats a
+            # declared fixed pose for it by the same courtyard (#1152).
             if not fp.pads:
                 # Zero-pad footprints (graphics-only mechanical parts, logos
                 # with a courtyard) used to be dropped entirely -- neither
@@ -1083,6 +1107,9 @@ class QuenchState:
                     self.parts[ref] = _Part(ref, fp, courtyards, True,
                                             halo_base, halo_coef,
                                             body_locals.get(ref))
+                    self.lock_reasons[ref] = (
+                        LOCK_FILE if ref in file_locked else
+                        LOCK_CALLER if ref in locked_refs else LOCK_PADLESS)
                 continue
             # #829: a footprint that draws part of the BOARD's own boundary is
             # never this tool's to move -- its pose transforms that Edge.Cuts
@@ -1110,12 +1137,18 @@ class QuenchState:
             self.parts[ref] = _Part(ref, fp, courtyards, locked,
                                     halo_base, halo_coef,
                                     body_locals.get(ref))
+            if locked:
+                self.lock_reasons[ref] = (
+                    LOCK_FILE if ref in file_locked else
+                    LOCK_CALLER if ref in locked_refs else
+                    LOCK_OUTLINE if owns_outline else LOCK_SCOPE)
             # A part with NO connected pins (mounting hole, NPTH, fiducial) is
             # invisible to the airwire cost -- only halo/edge decide where it
             # goes, which is how holes wander. Frozen by default; the caller
             # frees them explicitly with move_unconnected (--move-unconnected).
             if self.parts[ref].pin_count == 0 and not move_unconnected:
                 self.parts[ref].locked = True
+                self.lock_reasons.setdefault(ref, LOCK_UNCONNECTED)
             # Ignored nets (e.g. plane-routed power) don't contribute airwires
             self.parts[ref].nets = [n for n in self.parts[ref].nets
                                     if n not in ignore]
@@ -1175,6 +1208,8 @@ class QuenchState:
         for _ref in _fpk.seated_plugs(self.keepouts, pcb_data, pcb_file):
             if _ref in self.parts:
                 self.parts[_ref].locked = True
+                # Every earlier lock recorded its own cause, which stands.
+                self.lock_reasons.setdefault(_ref, LOCK_SEATED_PLUG)
         self.keepouts_for: Dict[str, Tuple[Dict, ...]] = {}
         if self.keepouts:
             from . import floorplan as _fp
@@ -3061,7 +3096,7 @@ class QuenchState:
             except Exception:
                 self._fab_local = {}
         p = self.parts.get(ref)
-        if p is None:
+        if p is None or ref in self._fab_rejected_refs():
             return None
         sides = self._fab_local.get(ref)
         if not sides:
@@ -3077,6 +3112,33 @@ class QuenchState:
             local = rotate_local_bounds(*lb, rot)
             self._fab_cache[key] = local
         return (x + local[0], y + local[1], x + local[2], y + local[3])
+
+    def _board_bodies(self):
+        """`body.board_bodies` for this state's board, read once (or None
+        when it cannot be read)."""
+        got = getattr(self, '_board_bodies_cache', False)
+        if got is False:
+            try:
+                from placement.body import board_bodies
+                got = board_bodies(self.pcb_data, self.pcb_file)
+            except Exception:                                # noqa: BLE001
+                got = None
+            self._board_bodies_cache = got
+        return got
+
+    def _fab_rejected_refs(self):
+        """Parts whose .Fab drawing `body.fab_cannot_be_body` rejects
+        (#1201): `fab_rect` / `fab_shape` answer None for them, so the
+        quench's body vetoes read the checker's body and never a pin-1 dot.
+        Their own .Fab reader is kept, rather than replaced by the ladder's
+        `drawn_local`, so every other part reads exactly what it did."""
+        got = getattr(self, '_fab_rejected_cache', None)
+        if got is None:
+            bodies = self._board_bodies() or {}
+            got = frozenset(r for r, g in bodies.items()
+                            if getattr(g, 'fab_rejected', False))
+            self._fab_rejected_cache = got
+        return got
 
     @staticmethod
     def _fab_side(p):
@@ -3097,7 +3159,7 @@ class QuenchState:
                 self._fab_shapes = {}
         p = self.parts.get(ref)
         sides = self._fab_shapes.get(ref)
-        if p is None or not sides:
+        if p is None or not sides or ref in self._fab_rejected_refs():
             return None
         own = self._fab_side(p)
         got = sides.get(own) or next(iter(sides.values()))
@@ -3158,11 +3220,7 @@ class QuenchState:
         got = getattr(self, '_bodyless_cache', None)
         if got is None:
             fps = getattr(self.pcb_data, 'footprints', {}) or {}
-            try:
-                from placement.body import board_bodies
-                bodies = board_bodies(self.pcb_data, self.pcb_file)
-            except Exception:                                # noqa: BLE001
-                bodies = None
+            bodies = self._board_bodies()
             out = set()
             for r in self.parts:
                 fp = fps.get(r)

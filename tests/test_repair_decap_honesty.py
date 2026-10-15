@@ -135,14 +135,17 @@ def test_a_zero_move_decap_violator_is_unresolved():
 
 def test_a_moved_violator_still_failing_is_unresolved_and_a_real_fix_is_not():
     pcb = parse_kicad_pcb(ESP)
-    r1, y1 = pcb.footprints['R1'], pcb.footprints['Y1']
+    r3, y1 = pcb.footprints['R3'], pcb.footprints['Y1']
     with tempfile.TemporaryDirectory() as td:
         intent, _p = _intent(td)
         # C3 onto the crystal Y1: 3.555mm from U1, inside the decap radius
         # (so graded, not `decap_ungraded`), and no move off Y1 that a pad
-        # conflict licenses brings it within 2mm. R2 onto R1.
+        # conflict licenses brings it within 2mm. R2 onto R3 -- not onto R1,
+        # which sits inside U2's silk-drawn body: since #1153 a part that
+        # moves off a pad conflict there and stays in that body is not
+        # repaired, so the real fix below could not be shown on it.
         board = _board(td, 'stacked.kicad_pcb',
-                       [('C3', y1.x, y1.y), ('R2', r1.x, r1.y + 0.3)])
+                       [('C3', y1.x, y1.y), ('R2', r3.x, r3.y + 0.3)])
         res = _repair(board, intent)
         moved = {m['reference'] for m in res['moves']}
         # The pad conflict moved C3 -- the arm is about a MOVED violator.
@@ -151,11 +154,9 @@ def test_a_moved_violator_still_failing_is_unresolved_and_a_real_fix_is_not():
         assert 'C3' not in res['repaired'], res['repaired']
         note = [n for n in res['notes'] if n.startswith('C3: UNRESOLVED')]
         assert note and 'it moved' in note[0], res['notes']
-        # R1/R2 is a pad conflict and nothing else: one of the pair moved
-        # off the other and that part IS repaired. (Its partner is repaired
-        # too without moving -- the pair is clear -- which is run-7 A2's
-        # legitimate zero-move case, not this issue's.)
-        fixed = {'R1', 'R2'} & set(res['repaired'])
+        # R2/R3 is a pad conflict and nothing else: one of the pair moved
+        # off the other and that part IS repaired.
+        fixed = {'R2', 'R3'} & set(res['repaired'])
         assert fixed & moved, (res['repaired'], moved)
         still = _decap_refs_after(board, res, intent, td, 'm.kicad_pcb')
         assert 'C3' in still, still
@@ -669,7 +670,11 @@ def test_cli_writes_the_refs_and_the_repaired_set_is_honest():
                                                       still)
         line = [ln for ln in r.stdout.splitlines()
                 if ln.startswith('Repair:')]
-        assert line and '1 unresolved' in line[0], line
+        # #1153: the other violator is R1, charged for sitting inside U2's
+        # silk-drawn body and never moved. It read "1 repaired (0 moved)"
+        # while the pair stayed on the board; it is unresolved too.
+        assert 'R1' in s['unresolved_refs'], s
+        assert line and '2 unresolved' in line[0], line
     print(f"  PASS: {line[0]}")
 
 

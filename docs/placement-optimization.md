@@ -697,7 +697,23 @@ own failure diagnostics* to decide what to move. Each round:
 4. Re-route. Accept only if (failures, then iterations) improves; otherwise
    revert and widen the displacement cap 1.5× for the next attempt — the
    nudge radius only. The swap cap stays at its base value, so a widened
-   round cannot become a long-range swap.
+   round cannot become a long-range swap. A candidate that lays a pad stack
+   the incumbent did not have — two parts' pad copper intersecting,
+   check_assembly's BLOCKING channel, a short when the nets differ — is
+   rejected before it is routed or judged (#858): the pairs go in the
+   round's `loop_round<N>.json` as `pad_stacks_new`, the count in
+   `JSON_SUMMARY.rounds_rejected_pad_stacks`.
+
+   That comparison sees neither `--intent` (which gates the moves only) nor
+   DRC, nor assembly beyond that pad-stack gate. `--accept-cmd CMD`
+   replaces it with a judge run as
+   `CMD <placed> <routed> <route.json>` that prints `SCORE=<float>`, lower
+   is better; the repo ships one (#1194), `py_tools/accept_blocking.py`,
+   which scores the routed board with `board_score` and the intent:
+   unrouted + broken first, then the rest of `blocking`, then vias —
+   `--accept-cmd "python3 py_tools/accept_blocking.py --intent INTENT.json"`.
+   It refuses (a rejected round) rather than score blind to an intent it
+   could not grade.
 
 Result on kit-dev-coldfire from the hand placement (recorded before #458;
 `failures` was then the pre-reconciliation count and `router iterations` the

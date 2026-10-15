@@ -1429,6 +1429,47 @@ def bodyless_pad_shape(fp, x=None, y=None, rot=None):
     return place_local_shape(unary_union(boxes), x, y, rot)
 
 
+# --- #1250: a test point under another part's drawn body ---------------------
+#
+# The marker waiver (`_MARKER_NONPHYSICAL`) excuses a test point's courtyard
+# pair and `_GATE_EXEMPT` excuses its containment, on the premise that a test
+# point has nothing above board level. Neither looks at the other direction:
+# a test point whose PAD a move carried under another part's body. That pad is
+# where the designer meant a probe or a bed-of-nails pin to land, and no probe
+# reaches copper under an IC. glasgow's TP6 moved 39.7 mm into U19's TSSOP
+# body and check_assembly --baseline called the board buildable, because the
+# only pair that saw it carried `marker_class`.
+#
+# Measured with the #1106 measurement (`bodyless_pad_shape` against a drawn
+# body, `pads_under_body_frac`), at its own `CONTAINMENT_FRAC`. On the 22
+# tracked boards 2 of 40 test points read covered, orangecrab TP26/TP27 under
+# J4 at 1.000, both the designer's own poses -- so the census GATES only when a
+# member moved relative to --baseline, as the courtyard gate does.
+
+class TestpointCover(NamedTuple):
+    testpoint: str
+    cover: str           # the part whose drawn body lies over the pad
+    frac: float          # share of the test point's pad copper under it
+    side: str            # the face it happens on ('F'/'B')
+    body_source: str     # the cover's drawn-body rung: 'fab' | 'silk'
+    # 'intent_declared' (the pair is in the intent's overlap_waivers) or
+    # 'container_class' (a board-sized outline other parts sit under), else
+    # ''. `marker_class` is deliberately never recorded: it is the label this
+    # census exists to look past.
+    waiver: str
+    # True when this finding gates once a member moves: a .Fab body (a silk
+    # body never gates, #896) and no waiver above.
+    gates_if_moved: bool
+
+
+def testpoint_covered_gating(findings, moved) -> list:
+    """The `TestpointCover` findings that GATE: gate-eligible and a member
+    moved relative to the baseline (`moved_refs`), the courtyard gate's
+    currency (#1250)."""
+    return [t for t in findings if t.gates_if_moved
+            and (t.testpoint in moved or t.cover in moved)]
+
+
 class BodyOverlapPair(NamedTuple):
     a: str
     b: str
@@ -1511,6 +1552,12 @@ class BodyOverlapPair(NamedTuple):
     # draws none, which KiCad cannot report: listed, never gating).
     hole: str = ''
     basis: str = ''
+    # #1201. For a CONTAINED pair: why it does not gate, or '' when it does
+    # -- the `_GATE_EXEMPT` waiver it carries, else 'silk_drawn' (a member's
+    # drawn body is silk, which never gates, #896). check_assembly prints
+    # it per pair, so a reader is never told a pair is "a marker or a
+    # board-sized container" when the silk rule is what let it through.
+    gate_exempt: str = ''
 
 
 def _pair_exact(a: GradedPart, b: GradedPart, s: str, ra, rb):
@@ -1781,6 +1828,10 @@ class LocalBounds(NamedTuple):
     # bbox (a pin-1 tick), so the union IS the pad bbox. A disclosure, not
     # an error -- a fragment must not be LABELLED a body.
     silk_rejected: bool = False
+    # #1201. The .Fab rung was a marking, not a body
+    # (`body.fab_cannot_be_body`). Appended LAST for the `_fields` reason
+    # `source` records above.
+    fab_rejected: bool = False
 
 
 def part_local_bounds(pcb_data, pcb_file: Optional[str] = None
@@ -1836,6 +1887,7 @@ def _part_local_bounds_and_bodies(pcb_data, pcb_file: Optional[str] = None):
         local = geom.occupancy_local if geom is not None else None
         source = geom.source if geom is not None else ''
         silk_rejected = bool(geom.silk_rejected) if geom is not None else False
+        fab_rejected = bool(getattr(geom, 'fab_rejected', False))
         if local is None:
             # SOURCE_NONE, or no readable board file at all: the +/-0.5mm
             # fiction, which `synthetic` marks so it can never gate.
@@ -1867,7 +1919,8 @@ def _part_local_bounds_and_bodies(pcb_data, pcb_file: Optional[str] = None):
                                tht_local=tht_local,
                                has_tht=has_tht, synthetic=synthetic,
                                from_courtyard=(source == SOURCE_COURTYARD),
-                               source=source, silk_rejected=silk_rejected)
+                               source=source, silk_rejected=silk_rejected,
+                               fab_rejected=fab_rejected)
     return out, bodies
 
 
@@ -2070,6 +2123,138 @@ def moved_refs_at(pcb_now, pcb_base, poses=None, eps: float = 1e-3) -> set:
 def courtyard_gating(blocking_pairs, moved) -> list:
     """The courtyard-blocking pairs that GATE: a member moved (run-23)."""
     return [q for q in blocking_pairs if q.a in moved or q.b in moved]
+
+
+# --- #1255: a component body's distance to the board edge --------------------
+#
+# Past the hard outline gate, the only pressure keeping a BODY off the edge was
+# the quench's soft halo (`_edge_penalty`), and no grader reads that cost.
+# render's `a_off_outline.courtyard` asks a different question: the courtyard
+# against the outline inset by the clearance and copper-edge floors. Neither
+# check_assembly nor board_score measured body-to-edge distance at all. A
+# 1.77 mm nudge put splitflap R1's fab body 1.00 mm from the south edge, and
+# every grader read the board exactly as before.
+#
+# The number belongs to an ASSEMBLER, not to the board. JLCPCB's assembly
+# terms ask for 2.5 mm between a component body and the board edge, and JLC
+# adds edge rails when the file has none, after which the board edge is no
+# longer the conveyor edge. Every human board measured breaks 2.5 mm
+# (splitflap, esp_prog, glasgow, watchy, ulx3s). So the census is REPORT-ONLY
+# unless the intent declares `assembly.body_edge_mm`, and then it gates every
+# part in the band.
+
+#: The band when nothing declares one. Reported as `derived_default`, always
+#: beside `BODY_EDGE_DEFAULT_CITATION`.
+BODY_EDGE_DEFAULT_MM = 2.5
+BODY_EDGE_DEFAULT_CITATION = (
+    'JLCPCB assembly terms, section 2 "Notes on DFM", item 3: "The distance '
+    'between the body of the components and the edge of the board must be '
+    'equal or greater than 2.5mm." One assembler\'s rule, which also adds '
+    'edge rails when the file has none (https://jlcpcb.com/help/article/'
+    'Terms-and-Conditions-of-JLCPCB-Assembly-Service, read 2026-10-14)')
+
+
+def body_edge_band(pcb_data, pcb_file: Optional[str] = None, *,
+                   threshold_mm: Optional[float] = None,
+                   edge_claim_refs: Sequence[str] = (),
+                   moved: Optional[set] = None,
+                   bodies=None) -> Dict[str, object]:
+    """Pad-bearing parts whose BODY lies within `threshold_mm` of the edge.
+
+    The body is the drawn one (`placement.body`: .Fab, else silk united with
+    the pads). A part that draws neither falls back to its occupancy rung,
+    which is the courtyard, else the pad box. `source` names the rung. The
+    body's rect at the part's pose is measured against the real outline at
+    margin 0 (`BoardOutlineGate.edge_clearance`, cutouts included). A body
+    that reaches past the outline reads 0.
+
+    Some parts belong at the edge by what they are. Edge-class parts
+    (`edge_receptacle` / `edge_actuator`), markers (`mount_hole` /
+    `fiducial` / `testpoint`) and refs in `edge_claim_refs` (an edge the
+    intent declares) are listed apart in `excluded`, with `why`, and never
+    counted. A connector-family part with no edge claim stays IN, because
+    those are most of the hits on human boards.
+
+    `threshold_mm` None means nothing declared a band: the band is
+    `BODY_EDGE_DEFAULT_MM`, labelled `derived_default`, and `gates` is False.
+    `moved` (a `moved_refs` set) adds `new_in_band`, the in-band parts that
+    moved relative to a baseline. `bodies` (a `board_bodies` map) skips the
+    board-file read.
+    """
+    declared = threshold_mm is not None
+    thr = float(threshold_mm) if declared else BODY_EDGE_DEFAULT_MM
+    out: Dict[str, object] = {
+        'threshold_mm': thr,
+        'threshold_basis': 'declared' if declared else 'derived_default',
+        'citation': None if declared else BODY_EDGE_DEFAULT_CITATION,
+        'gates': declared,
+        'measured': 0, 'eligible': 0, 'in_band': [], 'excluded': [],
+        'unmeasured': [],
+        'new_in_band': None, 'new_in_band_refs': None, 'error': None,
+    }
+    bi = getattr(pcb_data, 'board_info', None)
+    if bi is None or getattr(bi, 'board_bounds', None) is None:
+        # Unmeasured is not clean: a caller that gates must fail closed.
+        out['error'] = 'the board has no outline to measure against'
+        return out
+    from kicad_parser import non_aperture_pads
+    from placement.part_class import classify_part
+    if bodies is None:
+        from placement.body import board_bodies
+        bodies = board_bodies(pcb_data, pcb_file)
+    og = BoardOutlineGate(bi, 0.0)
+    claimed = set(edge_claim_refs or ())
+    in_band: list = []
+    excluded: list = []
+    unmeasured: list = []
+    measured = 0
+    eligible = 0          # measured and not excluded: the band's population
+    for ref, fp in sorted((pcb_data.footprints or {}).items()):
+        if not non_aperture_pads(fp):
+            continue                    # not pad-bearing: nothing to assemble
+        g = bodies.get(ref)
+        local, src = None, None
+        if g is not None:
+            if g.drawn_local is not None:
+                local, src = g.drawn_local, g.drawn_source
+            elif g.body_local is not None:
+                local, src = g.body_local, g.source
+        if local is None:
+            unmeasured.append(ref)
+            continue
+        x0, y0, x1, y1 = rotate_local_bounds(*local, fp.rotation or 0.0)
+        rect = (fp.x + x0, fp.y + y0, fp.x + x1, fp.y + y1)
+        mm = (0.0 if og.rect_outside_amount(rect) > EPS
+              else og.edge_clearance(rect))
+        measured += 1
+        try:
+            cls = classify_part(fp, ref).name
+        except Exception:                                    # noqa: BLE001
+            cls = None
+        why = (cls if cls in _EDGE_CLASSES or cls in _MARKER_CLASSES
+               else 'declared_edge' if ref in claimed else '')
+        if not why:
+            eligible += 1
+        if mm >= thr - EPS:
+            continue
+        row = {'ref': ref, 'mm': round(mm, 3), 'source': src,
+               'side': footprint_side(fp)}
+        if why:
+            row['why'] = why
+            excluded.append(row)
+        else:
+            in_band.append(row)
+
+    def _key(r):
+        return (r['mm'], r['ref'])
+    out.update(measured=measured, eligible=eligible,
+               in_band=sorted(in_band, key=_key),
+               excluded=sorted(excluded, key=_key), unmeasured=unmeasured)
+    if moved is not None:
+        new = [r['ref'] for r in out['in_band'] if r['ref'] in moved]
+        out['new_in_band'] = len(new)
+        out['new_in_band_refs'] = new
+    return out
 
 
 class PairWaivers:
@@ -2774,6 +2959,10 @@ def grade_body_overlap(pcb_data, clearance: float,
     silk_sourced: set = set()
     # #896. Seam inputs: every judged part's DRAWN body in board coordinates.
     seam_parts: list = []
+    # #1201. Parts whose .Fab drawing was rejected as a body (a pin-1 dot).
+    fab_rejected_refs: list = []
+    # #1250. Test points whose pad copper lies under another part's body.
+    testpoint_covered: List[TestpointCover] = []
 
     # -- DRAWN BODY channel (advisory) ----------------------------------------
     # Reads `placement.body`'s drawn-body ladder rather than calling
@@ -2789,6 +2978,8 @@ def grade_body_overlap(pcb_data, clearance: float,
             _bodies = board_bodies(pcb_data, path)
         except Exception:                                    # noqa: BLE001
             _bodies = {}
+        fab_rejected_refs = sorted(r for r, _g in _bodies.items()
+                                   if getattr(_g, 'fab_rejected', False))
         fab_parts = []
         for ref, fp in sorted(fps.items()):
             geom = _bodies.get(ref)
@@ -2879,6 +3070,40 @@ def grade_body_overlap(pcb_data, clearance: float,
                         waived=bool(waiver), waiver=waiver,
                         contained_frac=round(_f, 3), contained=True,
                         depth_mm=0.0))
+        # #1250: every TEST POINT's pad copper against every other same-face
+        # drawn body -- whether or not the test point draws a body of its
+        # own. TP6 draws silk, so the #1106 loop above never asks about it,
+        # and a body-less test point there carries `marker_class`, which
+        # `_GATE_EXEMPT` excuses. Fiducials are not in this census: human
+        # boards seat them under connectors on purpose (esp_prog Ref*~2 under
+        # USB1, orangecrab FID1/FID2 under J4/J5), and the containment
+        # channel already reports them.
+        for ref in sorted(fps):
+            if _waivers.class_of(ref) != 'testpoint':
+                continue
+            fp = fps[ref]
+            _ps = bodyless_pad_shape(fp)
+            if _ps is None:
+                continue
+            _sides = sides_occupied(footprint_side(fp),
+                                    footprint_has_through_pads(fp))
+            _pb = _ps.bounds
+            for rb, sb, rcb, shb in fab_parts:
+                if rb == ref or sb not in _sides:
+                    continue
+                if rect_overlap_area(_pb, rcb) <= EPS:
+                    continue
+                _f = pads_under_body_frac(_ps, shb)
+                if _f < CONTAINMENT_FRAC:
+                    continue
+                _label = _waiver_for(ref, rb)
+                _w = (_label if _label in ('intent_declared',
+                                           'container_class') else '')
+                _src = body_sources.get(rb, _BODY_NONE)
+                testpoint_covered.append(TestpointCover(
+                    testpoint=ref, cover=rb, frac=round(_f, 3), side=sb,
+                    body_source=_src, waiver=_w,
+                    gates_if_moved=(not _w and _src != _BODY_SILK)))
 
     # -- pad_intersection channel (never waivable) ----------------------------
     # #1064: lifted VERBATIM into `pad_intersection_pairs`, so place_pose
@@ -2932,6 +3157,26 @@ def grade_body_overlap(pcb_data, clearance: float,
     containment_blocking = [p for p in contained
                             if p.waiver not in _GATE_EXEMPT
                             and not _silk_drawn_pair(p)]
+
+    # #1201: name each contained pair's reason for not gating, READ OFF the
+    # gate above rather than re-derived beside it (a second copy could
+    # disagree and label a gating pair exempt). Stamped on the pair wherever
+    # it is listed -- `pairs`, `advisory_pairs`, `containment_pairs` -- so
+    # the JSON cannot say '' in one list and 'silk_drawn' in another.
+    _gating = {id(p) for p in containment_blocking}
+
+    def _gate_exempt(p) -> str:
+        if id(p) in _gating:
+            return ''
+        if p.waiver in _GATE_EXEMPT:
+            return p.waiver
+        return 'silk_drawn'
+    _stamped = {id(p): p._replace(gate_exempt=_gate_exempt(p))
+                for p in contained}
+    pairs = [_stamped.get(id(p), p) for p in pairs]
+    advisory = [_stamped.get(id(p), p) for p in advisory]
+    containment_blocking = [_stamped[id(p)] for p in containment_blocking]
+    contained = [_stamped[id(p)] for p in contained]
     # Courtyard BLOCKING (run-23): the subset of courtyard pairs that gates --
     # `courtyard_blocking`'s floors and `PairWaivers.blocking_waived`'s ladder,
     # which carries the run-22/23 edge-LIVE geometry condition, the
@@ -3003,6 +3248,7 @@ def grade_body_overlap(pcb_data, clearance: float,
             # so a reader can tell a housing outline from a fab outline
             # rather than being told only that something was judged.
             'body_sources': dict(body_sources),
+            'fab_rejected_refs': fab_rejected_refs,
             # #896. The tightest DRAWN-body seam on the board, signed
             # (negative = overlap). `body_overlap_pairs` reports a depth only
             # for pairs that already overlap, so a board one micron from a
@@ -3011,6 +3257,11 @@ def grade_body_overlap(pcb_data, clearance: float,
             # the chain produced that number. None when fewer than two parts
             # draw a body.
             'body_seam': (_seam._asdict() if _seam is not None else None),
+            # #1250: test points whose pad copper lies under another part's
+            # drawn body (`TestpointCover`). ABSOLUTE here; the caller gates
+            # the moved subset (`testpoint_covered_gating`), because the
+            # corpus ships two such poses by design (orangecrab TP26/TP27).
+            'testpoint_covered': testpoint_covered,
             # Run-23 courtyard blocking channel -- see the selection above.
             # NOTE these pairs also remain in `advisory`/`advisory_pairs`
             # (that count's meaning is unchanged for its existing consumers);
@@ -4083,6 +4334,18 @@ class PartPads:
             return None
         return (x + e[0], y + e[1], x + e[2], y + e[3])
 
+    def hole_extent_rects(self, x: float, y: float, rot: float):
+        """[(x0, y0, x1, y1)] one box per NPTH hole at its EXTENT radius (the
+        holes `extent` folds into the union), rotated as `extent_local`
+        rotates them -- so a census can grade each drill ALONE (#1193)."""
+        rad = math.radians(-self._delta_key(rot))
+        hc, hs = math.cos(rad), math.sin(rad)
+        out = []
+        for ox, oy, r in self.holes_extent:
+            cx, cy = x + ox * hc - oy * hs, y + ox * hs + oy * hc
+            out.append((cx - r, cy - r, cx + r, cy + r))
+        return out
+
     def extent_local_side(self, rot: float, side: str):
         """`extent_local`, restricted to the pads that occupy `side` (#834).
 
@@ -5138,6 +5401,27 @@ def _copper_vertices(geom) -> List[Tuple[float, float]]:
     return out
 
 
+def pad_copper_outside_amount(pp, x: float, y: float, rot: float, gate,
+                              skip_rings=None) -> float:
+    """The worst SINGLE copper pad's outline violation, each pad's rect graded
+    alone -- `grade_pad_legality`'s `oob_pad_copper_refs` magnitude (#937),
+    which calls this, and `seeder.repair_placement`'s off-board census
+    (#1193). 0.0 for a part with no copper pads.
+
+    Never the part's pad UNION: on a notched outline that box's corner can
+    sit in the notch while no pad does (StickHub's locked J5, charged 0.65 mm
+    and exit 4 with `oob_pad_copper_refs` empty)."""
+    return max((gate.rect_outside_amount(r[:4], skip_rings=skip_rings)
+                for r in pp.pad_rects(x, y, rot)), default=0.0)
+
+
+def part_outline_rings(gate, pads):
+    """The interior rings `pads`' own centres enclose -- the #628 ownership
+    exemption (a part whose pads ring a milled relief owns that ring), shared
+    by `grade_pad_legality`'s two off-board censuses and the repair's."""
+    return gate.rings_enclosing([(p.global_x, p.global_y) for p in pads or ()])
+
+
 def pad_copper_overrun_mm(pads, gate) -> float:
     """How far `pads`' copper reaches past the outline, in mm: THE gating
     measure for pad copper off the board (#1096), shared by check_assembly
@@ -5774,10 +6058,11 @@ def grade_pad_legality(pcb_data, clearance: float, exact: bool = True,
             # The same #628 ownership exemption the AABB pass takes: a part
             # whose own pads ring a milled relief OWNS that ring and must not
             # be graded as hanging off it.
-            own = pad_gate.rings_enclosing(
-                [(p.global_x, p.global_y) for p in pads_by_ref.get(ref, ())])
-            amt = max((pad_gate.rect_outside_amount(r[:4], skip_rings=own)
-                       for r in rects), default=0.0)
+            own = part_outline_rings(pad_gate, pads_by_ref.get(ref, ()))
+            # #1193: the one per-pad measure, which the repair census reads.
+            amt = pad_copper_outside_amount(pp, fp.x, fp.y,
+                                            fp.rotation or 0.0, pad_gate,
+                                            skip_rings=own)
             if amt > EPS:
                 oob_copper_refs.append([ref, round(amt, 4)])
                 # #1096: the DISTANCE past the outline, on each pad's TRUE

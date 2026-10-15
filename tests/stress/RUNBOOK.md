@@ -1188,10 +1188,17 @@ python3 -X utf8 tests/stress/strip_copper_only.py \
 **Do NOT use `strip_routing.py` or `prep_set2.py` for this.** They are corpus
 normalizers and they rewrite `Edge.Cuts`, so the subject would no longer share an
 outline with the human reference it is graded against. `strip_copper_only.py`
-drops exactly four form types (top-level `segment`, `arc`, `via`, and
-`filled_polygon` inside zones) and leaves poses, pads, zones, stackup and outline
-untouched; verified on castor_pollux, 14241 segments and 358 vias to zero with an
-identical pose digest and identical bounds.
+drops routing output and nothing else: top-level `segment`, `arc` and `via`,
+`filled_polygon` inside zones, TEARDROP zones (`(attr (teardrop ...))`, which
+KiCad generates on every pad or via a track meets), `generated` forms (length-
+tuning patterns, whose `base_line`/`origin`/`end` are the human track's
+coordinates) none of whose members survives, and groups that lost every member
+to those drops (#1164). Its summary line counts each kind. It leaves poses,
+pads, ordinary zones (pours, keep-outs), stackup and outline untouched;
+verified on castor_pollux, 14241 segments and 358 vias to zero with an
+identical pose digest and identical bounds. The placement gates count a
+teardrop zone as routed copper, so a board stripped by anything that keeps
+them is refused the way a routed one is.
 
 ### 1. Qualify the board (seconds, not an hour)
 

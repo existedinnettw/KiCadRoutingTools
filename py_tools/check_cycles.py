@@ -156,7 +156,9 @@ def main():
     args = ap.parse_args()
 
     pcb = parse_kicad_pcb(args.board)
-    zoned = {z.net_id for z in (getattr(pcb, 'zones', []) or [])}
+    from kicad_parser import pour_zones
+    # Pour meshes are hidden; a teardropped signal net is still checked (#1164).
+    zoned = {z.net_id for z in pour_zones(getattr(pcb, 'zones', None))}
     segs_by_net = defaultdict(list)
     for s in pcb.segments:
         segs_by_net[s.net_id].append(s)

@@ -247,11 +247,16 @@ def test_a_pour_outline_off_the_board_does_not_move_the_camera():
     OUTLINE, which may run past the board (KiCad clips the fill). lvds has a
     net-0 B.Cu zone at (0,0), 80 mm from the board: counted in the fit, its
     reveal shrank the board to a quarter of the box (the review of the
-    per-state fit)."""
+    per-state fit). Since #1205 the scene clips pours to the board and that
+    zone never reaches the page, so the page's own guard is held by handing
+    it the off-board pour directly."""
     board = os.path.join(ROOT, 'kicad_files',
                          'lvds_converter_dualclk_gnd.kicad_pcb')
     pcb = parse_kicad_pcb(board)
     sc = SC.build_scene(pcb)
+    sc['pours'].append({'net': 0, 'layer': len(sc['layers']) - 1, 'holes': [],
+                        'poly': [[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3],
+                                 [-0.3, 0.3]]})
     tl = _one_state_timeline(pcb)
     st = dict(tl['states'][0], zones=sorted({z['net'] for z in sc['pours']}))
     tl['states'].append(st)

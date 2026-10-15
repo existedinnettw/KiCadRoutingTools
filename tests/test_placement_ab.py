@@ -583,12 +583,17 @@ ROWS = [
         'ignore_nets': ['GND'],
         'signal': 'edge_facing_pads',
         'guard': ('crossings', 'hpwl', 'inversions', 'body_blocking'),
-        'expect': 'regress',
+        # #1172 (fa10 P2): regress -> improve. Its courtyard tier seats J18
+        # clear of J3's courtyard on BOTH arms (the old seed overlapped them
+        # by 5.03mm2), and on that seed the pin-order inversions fall with
+        # the rest. Toggling `_stage1_choose_edge_angle` and
+        # `_edge_courtyard_tier` off restores the old mark exactly. The term
+        # stays rejected: facing-seed-esp_prog still regresses.
+        'expect': 'improve',
         'rejected': True,
         'why': ('MECHANISM: as facing-seed-esp_prog, with the wire guards '
                 'going the OTHER way: crossings and wire length fall with '
-                'the signal here, and pin-order inversions alone rise -- '
-                'one guard is enough, as declared before the run. `unseated` '
+                'the signal here. `unseated` '
                 'is in the baseline because the first form of this arm lost '
                 "the seeder's whole-board sweep on the OFF path and this "
                 'board is where that showed.'),
@@ -743,6 +748,12 @@ _AFTER_ICS_MARKS = {
     # back restores improve / regress: the attribution toggle).
     ('decap-within-limit', 'ulx3s'): 'neutral',
     ('decap-after-queue', 'ulx3s'): 'neutral',
+    # #1172 (fa10 P2): splitflap's seed moved -- the courtyard tier seats
+    # J18 clear of J3's courtyard (5.03mm2 before, the OFF arm's one intent
+    # error, a `legality` one) -- and on that seed these two read
+    # neutral, not regress. The #1172 flags off restore regress exactly.
+    ('decap-after-ics', 'splitflap_driver'): 'neutral',
+    ('decap-within-limit', 'splitflap_driver'): 'neutral',
 }
 ROWS += [
     {
@@ -925,6 +936,45 @@ ROWS += [
     }
     for b, ign in (('glasgow_revC.kicad_pcb', ['GND', '+3V3']),
                    ('rp2350_fpga_eensy_prePlane.kicad_pcb', []))
+]
+ROWS += [
+    {
+        # #1172: stage 1 chooses an undeclared edge connector's angle on a
+        # pile (`_stage1_claims`: least depth into the board, or the strong
+        # mating face), and keeps its courtyard off the connectors it has
+        # seated (`_placed_courtyard_hits`, prefer-then-fall-back); a chosen
+        # angle that seats nowhere clean falls back to the input angle.
+        # OFF = both switches off: the pile's angle 0 and the pad-only
+        # neighbour check of before. Packing (`_stage1_packed_starts`) is
+        # off in both arms.
+        'name': f'edge-angle-pile-{b[:-len(".kicad_pcb")]}',
+        'board': b,
+        'engine': 'seed',
+        'input': 'pile_edges',
+        'corridors': [],
+        'seeder_flags': {'off': {'_stage1_choose_edge_angle': False,
+                                 '_edge_courtyard_tier': False},
+                         'on': {}},
+        'ignore_nets': ign,
+        # The intent declares nothing but the edge claims, so its errors ARE
+        # the edge_connector errors -- a connector seated across its edge or
+        # facing away. The courtyard overlap #1172 measured guards it: on a
+        # board whose connectors never overlap it cannot move.
+        'signal': 'intent_errors',
+        'guard': ('crossings', 'hpwl', 'unseated', 'courtyard_blocking'),
+        'expect': exp,
+        'why': ('MECHANISM: a connector seated at the pile angle runs its '
+                'long axis across the board and its shell into the next '
+                'connector, and a strong-faced one opens into the board; '
+                'turned to the least depth or to its face, and seated clear '
+                'of the placed courtyards, it does none of these. '
+                'splitflap\'s north-edge claims seat without an edge error '
+                'or an overlap at either angle.'),
+    }
+    for b, ign, exp in (
+        ('glasgow_revC.kicad_pcb', ['GND', '+3V3'], 'improve'),
+        ('sonde_u.kicad_pcb', ['GND'], 'improve'),
+        ('splitflap_driver.kicad_pcb', ['GND', '+5V', '+3V3'], 'neutral'))
 ]
 ROWS += [
     {
@@ -1313,6 +1363,56 @@ def _pile_inputs(board_path, d, require_decaps=True):
     seed_refs = (set(st.stacked_suspect_refs)
                  if st.partially_unplaced and not st.unplaced else None)
     return pile, floorplan.load_intent(ipath), doc, seed_refs
+
+
+def _pile_edge_inputs(board_path, d):
+    """#1172's basis: `board_path` piled by the free-agent skill's
+    `make_unplaced.py` -- every pad-bearing part moved into one cluster off
+    the outline and UNLOCKED -- under an intent that carries only the PLACED
+    board's own edge claims (`emit_intent` off the designer's board, the
+    entries `Intent.edge_claims()` keeps).
+
+    Not `_pile_inputs`: #1105's staging keeps a file-locked part where it
+    is, and the tracked boards lock exactly the connectors this row is
+    about (glasgow's J1-J4), so stage 1 had nothing to seat and both arms
+    wrote the same board. The claims are the designer's, not this tool's:
+    the edge each connector sits on, its emitted band and class. Nothing
+    else is declared, so the row measures stage 1 and what follows from it.
+
+    Returns `(pile, intent, None)`: no seed scope, every part is piled."""
+    import subprocess
+    from kicad_parser import parse_kicad_pcb
+    from placement import floorplan
+    from placement.placement_state import assess_placement
+    pdir = os.path.join(d, 'pile_edges')
+    os.makedirs(pdir, exist_ok=True)
+    pile = os.path.join(pdir, os.path.basename(board_path))
+    r = subprocess.run(
+        [sys.executable, '-X', 'utf8',
+         os.path.join(ROOT, '.claude', 'skills', 'pcb-free-agent', 'scripts',
+                      'make_unplaced.py'), board_path, pile],
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        cwd=ROOT)
+    if r.returncode != 0 or not os.path.isfile(pile):
+        raise AssertionError(f"{board_path}: make_unplaced exited "
+                             f"{r.returncode}: {(r.stdout + r.stderr)[-800:]}")
+    if not assess_placement(parse_kicad_pcb(pile), pile).unplaced:
+        raise AssertionError(f"{pile}: piled, but assess_placement does not "
+                             f"read it as unplaced")
+    placed = floorplan.emit_intent(parse_kicad_pcb(board_path), board_path,
+                                   group_sources=GROUP_SOURCES)
+    claims = [c for c in placed.get('edge_connectors') or ()
+              if c.get('edge') and c.get('class') != 'connector_affinity']
+    if len(claims) < 2:
+        raise AssertionError(f"{board_path}: the placed board's intent "
+                             f"claims {len(claims)} edge(s); a #1172 row "
+                             f"needs at least two")
+    doc = {'schema': floorplan.SCHEMA_VERSION, 'kind': floorplan.KIND,
+           'units': 'mm', 'edge_connectors': claims}
+    ipath = os.path.join(d, 'pile_edge_intent.json')
+    with open(ipath, 'w', encoding='utf-8') as fh:
+        json.dump(doc, fh)
+    return pile, floorplan.load_intent(ipath), None
 
 
 def _pile_forecast(doc):
@@ -1727,7 +1827,13 @@ def run_row(row, workdir):
         _ign = list(row.get('ignore_nets') or ())
         i_off = i_on = i_grade = intent
         seed_board, scope = board, {}
-        if row.get('input') == 'pile':
+        if row.get('input') == 'pile_edges':
+            # #1172: an unaided pile carrying the placed board's edge claims.
+            seed_board, i_off, _refs = _pile_edge_inputs(board, d)
+            i_on = i_grade = i_off
+            if _refs is not None:
+                scope = {'seed_refs': _refs}
+        elif row.get('input') == 'pile':
             # #1105: the issue's own basis -- an unaided pile of this board,
             # one CLI-emitted --decaps-from intent for both arms and the
             # grade, seeded with place_seed's own scope.

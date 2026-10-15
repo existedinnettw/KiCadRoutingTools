@@ -178,7 +178,7 @@ ROWS = [
 
     # ---- #1002: decaps ------------------------------------------------------
     ('auto-derives-on-a-partial-pile', 'fp',
-     "        if _st.unplaced or _st.partially_unplaced:",
+     "        if _st.pile:",
      "        if _st.unplaced:",
      (T_DECAPS,), 'KILLED'),
     ('auto-withholds-into-budget-withheld', 'fp',

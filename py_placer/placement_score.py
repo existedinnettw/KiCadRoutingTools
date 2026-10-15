@@ -2,6 +2,7 @@
 """Placement quality on a COPPER-FREE board -- the terms a lap can be ranked by (#894).
 
     python3 -X utf8 py_placer/placement_score.py BOARD [--json PATH] [--intent PATH]
+                                                 [--length-groups JSON]
 
 Why this exists
 ---------------
@@ -41,6 +42,13 @@ three build on geometry primitives -- `legality.pad_rect`, `rect_area`,
 rather than on a second copy of a grader, and `edge_facing`'s core lives in
 `placement.edge_facing` so `floorplan.rule_pins_to_edge` and the seeder read
 the same number.
+
+One REPORT-ONLY section rides beside the terms and is NOT one of them:
+`length_groups` (#1252), each declared matched group's length-FLOOR spread --
+the copper the placement forces each member to have, and how much the group
+must add to match at all. It is not in `TERM_ORDER`, so `compare_terms` and
+the lap ledger never read it; `length_group_floors` says why and what it
+cannot see.
 
 Vacuity
 -------
@@ -198,18 +206,63 @@ def pin_order_crossings(pin_order_doc) -> dict:
                          'span_mm': r.get('span_mm')} for r in crossed])
 
 
-def pair_length(pin_order_doc) -> dict:
-    """The worst straight-line span of a declared differential pair, in mm.
+#: The rule that chooses `pair_length`'s population, named in its basis so a
+#: lap scored before #1251 (direct rows only) is `not-comparable` against one
+#: scored after it, as `BALANCE_BASIS` does for #1143.
+PAIR_LENGTH_BASIS = ('pair rows: two parts carrying both nets, plus pairs '
+                     'composed end to end through per-leg series parts '
+                     '(#1251)')
 
-    PURE, over the same rows. `span_mm` is `board_context._pair_span_mm`'s
-    number and PR #917 added it for exactly this: over the nets two parts
-    share, the MINIMUM pad-centre distance per net, then the MAXIMUM over
-    nets. Worst-net, best-pad -- a bus is as long as its longest member.
+#: The fields a composed row (#1251) carries into `pairs[]`.
+_COMPOSED_KEYS = ('series', 'legs_mm', 'leg_skew_mm', 'span_basis',
+                  'stops_at', 'note')
+
+
+def _is_pair_row(row) -> bool:
+    """A pair-scoped row: `pair POS/NEG...`, or the bare `pair` a raised pair
+    branch leaves. Reading only `startswith('pair ')` dropped the second, and
+    the term then reported that no pair had been found (#1251)."""
+    scope = str(row.get('scope') or '')
+    return scope == 'pair' or scope.startswith('pair ')
+
+
+def _raised(row) -> str:
+    """The exception a bare-`pair` row records, as precisely as it says."""
+    if row.get('error'):
+        return str(row['error'])
+    verdict = str(row.get('verdict') or '')
+    if verdict.startswith('NOT MEASURED (') and verdict.endswith(')'):
+        return verdict[len('NOT MEASURED ('):-1]
+    return verdict or 'an unnamed error'
+
+
+def pair_length(pin_order_doc) -> dict:
+    """The worst span of a declared differential pair, in mm.
+
+    PURE, over the same rows. For a pair two parts carry whole, `span_mm` is
+    `board_context._pair_span_mm`'s number and PR #917 added it for exactly
+    this: over the nets two parts share, the MINIMUM pad-centre distance per
+    net, then the MAXIMUM over nets. Worst-net, best-pad -- a bus is as long
+    as its longest member.
+
+    A pair through per-leg series parts (AC caps, USB series resistors) is
+    carried whole by no two parts, and #1251 found every such pair missing:
+    ulx3s's 14 pairs gave no row. `board_context.composed_pair_rows` composes
+    them through the router's own junction rule; such a row's `span_mm` is its
+    longer leg's pad-centre polyline through the series pads, and `pairs[]`
+    carries both legs and |P - N| (`legs_mm`, `leg_skew_mm`) as numbers, not
+    as a verdict.
 
     Reads the PAIR-scoped rows only. A differential pair's polarity is a
     two-net question and asking it as part of the whole interface hides it:
     on the run-25 fixture one part pair AGREES over three shared nets while
     the two pair nets alone are CROSSED.
+
+    When nothing is measured the reason names WHICH of four things happened,
+    with its count: no pair was found; pairs were found but none is carried
+    whole by two parts or composes through series parts (named); the pair
+    branch raised (named); rows were found without a span. They used to share
+    one reason, "found no differential pair", which was false for three.
     """
     unit = 'mm'
     if not isinstance(pin_order_doc, dict):
@@ -217,29 +270,82 @@ def pair_length(pin_order_doc) -> dict:
     if pin_order_doc.get('error'):
         return _skip(f"board_context.pin_order_rows could not measure: "
                      f"{pin_order_doc['error']}", unit)
-    rows = [r for r in (pin_order_doc.get('rows') or [])
-            if str(r.get('scope') or '').startswith('pair ')]
+    census = pin_order_doc.get('pairs')
+    census = census if isinstance(census, dict) else None
+    rows = [r for r in (pin_order_doc.get('rows') or []) if _is_pair_row(r)]
+    raised = [r for r in rows if str(r.get('scope') or '') == 'pair']
+    rows = [r for r in rows if r not in raised]
+    if raised:
+        # The population is INCOMPLETE, so no worst is reported -- a max over
+        # the rows that happened to be measured before the error would read
+        # as the board's worst pair.
+        return _skip(
+            f"the pair branch of board_context.pin_order_rows raised "
+            f"({'; '.join(_raised(r) for r in raised)}), so the pair "
+            f"population is incomplete and no worst span is reported"
+            + (f' ({len(rows)} pair row(s) were measured before it)'
+               if rows else ''),
+            unit, raised=[_raised(r) for r in raised], pair_rows=len(rows))
     spans = [(r['span_mm'], r) for r in rows
              if isinstance(r.get('span_mm'), (int, float))]
+    unspanned = [{'a': r.get('a'), 'b': r.get('b'), 'scope': r.get('scope'),
+                  'verdict': r.get('verdict'), 'note': r.get('note')}
+                 for r in rows
+                 if not isinstance(r.get('span_mm'), (int, float))]
+    found = len(census['found']) if census else None
+    not_measured = list(census.get('not_measured') or []) if census else []
     if not spans:
-        # TWO different answers, and they must not share a reason: no pair was
-        # FOUND, versus pairs were found but none carried a span.
         if rows:
             return _skip(
                 f'{len(rows)} differential-pair row(s) were found, but none '
                 f'carries a span_mm, so the pair length was not measured',
-                unit, pair_rows=len(rows))
+                unit, pair_rows=len(rows), rows_without_span=unspanned,
+                pairs_found=found)
+        if found:
+            named = '; '.join(f"{p['pair']} ({p['why']})"
+                              for p in not_measured[:6])
+            more = (f' (and {len(not_measured) - 6} more)'
+                    if len(not_measured) > 6 else '')
+            return _skip(
+                f'list_nets.find_differential_pairs found {found} pair(s), '
+                f'but none is carried whole by two parts and none composes '
+                f'end to end through per-leg series parts: {named}{more}',
+                unit, pairs_found=found, not_measured=not_measured)
+        if census is None:
+            # A document from before the census, or a hand-built one: it
+            # cannot say whether a pair was found, so this does not claim
+            # that none was.
+            return _skip('board_context.pin_order_rows reported no '
+                         'differential-pair row, and no pair census to say '
+                         'whether any pair was found', unit)
         return _skip(
             'list_nets.find_differential_pairs found no differential pair on '
             'this board (it is name-based, and 2-terminal resonators are '
             'rejected). --impedance-nets is a route.py glob list, not a pair '
-            'source, and is deliberately not read here', unit)
+            'source, and is deliberately not read here', unit, pairs_found=0)
     worst, row = max(spans, key=lambda t: t[0])
+
+    def published(r):
+        out = {'a': r['a'], 'b': r['b'], 'scope': r['scope'],
+               'span_mm': r['span_mm'], 'verdict': r.get('verdict')}
+        if r.get('composed'):
+            out['composed'] = True
+            out.update({k: r.get(k) for k in _COMPOSED_KEYS})
+        return out
+    # BASIS: the rule plus the measured rows. The population is pose-invariant
+    # on one board (which parts carry which nets), so two laps of one board
+    # share it -- and a lap that lost a row, or was scored under the old rule,
+    # is refused rather than compared as if it were the same max.
     return _term(round(float(worst), 3), unit,
-                 pairs=[{'a': r['a'], 'b': r['b'], 'scope': r['scope'],
-                         'span_mm': r['span_mm'], 'verdict': r.get('verdict')}
+                 basis=[PAIR_LENGTH_BASIS] + sorted(
+                     f"{r['a']}~{r['b']} {r['scope']}" for _s, r in spans),
+                 pairs=[published(r)
                         for _s, r in sorted(spans, key=lambda t: -t[0])],
-                 worst_pair=f"{row['a']}~{row['b']} {row['scope']}")
+                 worst_pair=f"{row['a']}~{row['b']} {row['scope']}",
+                 pairs_found=found,
+                 composed=sum(1 for _s, r in spans if r.get('composed')),
+                 rows_without_span=unspanned,
+                 not_measured=not_measured)
 
 
 # ----------------------------------------------------------- cluster to pin
@@ -712,10 +818,207 @@ def edge_facing(pcb_data, pcb_file=None, intent=None) -> dict:
                  excluded=sorted(excluded), exclusion_basis=exclusion_basis)
 
 
+# ------------------------------------------------------------ length groups
+
+#: What a length-floor spread cannot see, printed with every `length_groups`
+#: section that was asked for (#1252). A floor spread is not a routed spread.
+LENGTH_FLOOR_CANNOT_SEE = (
+    'detours around obstacles: each floor is a straight 0/45/90 run between '
+    'pad centres',
+    'layer assignment (outer vs inner velocity), vias and via barrel length',
+    'meander room near the short members: copper_to_add_mm says how much '
+    'copper the group must add, not whether it fits',
+    'fly-by and T topologies: a multipoint floor (farthest pad pair on '
+    'different parts) bounds the total copper of any tree that spans the '
+    'net, not one driver-to-receiver path',
+    'pad die_length (package delay; not parsed, #1248) and where a track '
+    'enters a pad (pad-edge entry)',
+    '`mode: pin_pair` is echoed, not used: the floor is the net floor above, '
+    'not the pads[0] -> pads[1] path board_score grades in that mode',
+)
+
+
+def load_length_groups(path) -> dict:
+    """`board_score --length-groups`'s file: ``{"G": {"nets": [...],
+    "tolerance_mm": t, "mode": "pin_pair"?}}``.
+
+    Refuses (ValueError) only what `board_score.score_length` would crash on --
+    not a JSON object of objects, or a tolerance that is not a number -- so a
+    file one tool accepts the other does too. A group naming fewer than two
+    nets on the board is a per-group `ran: false`, as there.
+    """
+    with open(path, encoding='utf-8') as fh:
+        groups = json.load(fh)
+    if not isinstance(groups, dict):
+        raise ValueError('the file must be a JSON object of '
+                         '{"group": {"nets": [...], "tolerance_mm": t}}')
+    for name, spec in groups.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f'group {name!r} is not an object')
+        nets = spec.get('nets', [])
+        if not isinstance(nets, list) or not all(isinstance(n, str)
+                                                 for n in nets):
+            raise ValueError(f'group {name!r}: "nets" must be a list of '
+                             f'net names')
+        try:
+            float(spec.get('tolerance_mm', 0.1))
+        except (TypeError, ValueError):
+            raise ValueError(f'group {name!r}: "tolerance_mm" is not a '
+                             f'number') from None
+    return groups
+
+
+def _octilinear(a, b) -> float:
+    """The shortest 0/45/90 run between two pad centres."""
+    dx = abs(float(a.global_x) - float(b.global_x))
+    dy = abs(float(a.global_y) - float(b.global_y))
+    return max(dx, dy) + (math.sqrt(2.0) - 1.0) * min(dx, dy)
+
+
+def net_length_floor(pcb_data, net_id):
+    """`(floor, None)` or `(None, why)`: the least copper a net can have.
+
+    * 2 parts: the octilinear distance between the CLOSEST pad centres of the
+      two parts -- a lower bound on any 0/45/90 pad-centre route joining them.
+    * 3+ parts: the octilinear distance of the FARTHEST pad pair on different
+      parts -- a lower bound on any tree that spans the net, since the tree
+      holds a path between those two pads.
+
+    Copper pads only (`pad_has_copper`): an NPTH hole carrying a net is not a
+    connection (#328), and a paste window is not a pin (#1143).
+    """
+    from kicad_parser import pad_has_copper
+    net = (getattr(pcb_data, 'nets', None) or {}).get(net_id)
+    by_part = {}
+    for pad in (getattr(net, 'pads', None) or ()):
+        if pad_has_copper(pad):
+            by_part.setdefault(pad.component_ref, []).append(pad)
+    if len(by_part) < 2:
+        return None, ('it has no copper pad' if not by_part else
+                      f'its copper pads are on one part only '
+                      f'({next(iter(by_part))})')
+    refs = sorted(by_part, key=str)
+    cross = [(_octilinear(a, b), a, b)
+             for i, ra in enumerate(refs) for rb in refs[i + 1:]
+             for a in by_part[ra] for b in by_part[rb]]
+    two = len(refs) == 2
+    pick = (min if two else max)(cross, key=lambda t: t[0])
+    return {'floor_mm': round(pick[0], 3),
+            'basis': '2-part' if two else 'multipoint',
+            'parts': refs,
+            'pads': [f'{pick[1].component_ref}.{pick[1].pad_number}',
+                     f'{pick[2].component_ref}.{pick[2].pad_number}'],
+            '_raw': pick[0]}, None
+
+
+def _velocity_layers(pcb_data):
+    """(outer layer, first inner layer or None) for the ps figures."""
+    layers = list(getattr(pcb_data.board_info, 'copper_layers', None) or ())
+    outer = layers[0] if layers else 'F.Cu'
+    inner = layers[1] if len(layers) > 2 else None
+    return outer, inner
+
+
+def length_group_floors(pcb_data, groups, source=None) -> dict:
+    """REPORT-ONLY: each declared length group's floor spread (#1252).
+
+    A placement fixes the shortest copper each member of a matched group can
+    have, and nothing graded that before routing: the routed graders
+    (`board_score` / `check_complete --length-groups`) measure copper that
+    does not exist yet on a copper-free board. Per group this reports each
+    member's floor (`net_length_floor`) with its basis, the longest floor and
+    its net, the spread of floors, `copper_to_add_mm` = sum(longest - own
+    floor) -- the copper the group must add to match at all -- and the
+    longest floor in ps on an outer and an inner layer
+    (`impedance.get_layer_ps_per_mm`). `tolerance_mm` is printed beside the
+    spread with NO pass/fail: meanders can always add copper, so a floor
+    spread is not a routed spread.
+
+    NOT a term. It is not in `TERM_ORDER`, so `compare_terms` and the lap
+    ledger are unchanged; a search or the seeder may rank by it only after
+    `tests/test_placement_ab.py` (>= 3 distinct boards, paired and
+    directional).
+    """
+    base = {'report_only': True, 'source': source,
+            'cannot_see': list(LENGTH_FLOOR_CANNOT_SEE)}
+    if groups is None:
+        return dict(base, ran=False, groups={},
+                    reason='no --length-groups given; no matched group\'s '
+                           'length floors are measured')
+    from impedance import get_layer_ps_per_mm
+    outer, inner = _velocity_layers(pcb_data)
+    stackup = bool(getattr(pcb_data.board_info, 'stackup', None))
+    ps_mm = {'outer': get_layer_ps_per_mm(pcb_data, outer),
+             'inner': get_layer_ps_per_mm(pcb_data, inner) if inner else None}
+    velocity = {'outer': {'layer': outer,
+                          'ps_per_mm': round(ps_mm['outer'], 3)},
+                'inner': ({'layer': inner,
+                           'ps_per_mm': round(ps_mm['inner'], 3)}
+                          if inner else None),
+                'stackup': stackup}
+    notes = []
+    if not inner:
+        notes.append('the board has no inner copper layer')
+    if not stackup:
+        notes.append('the board declares no stackup, so every layer gets '
+                     'get_layer_ps_per_mm\'s default dielectric')
+    if notes:
+        velocity['note'] = '; '.join(notes)
+    by_name = {n.name: nid for nid, n in (pcb_data.nets or {}).items()
+               if getattr(n, 'name', None)}
+    out = {}
+    for gname, spec in groups.items():
+        names = list(spec.get('nets', []))
+        tol = float(spec.get('tolerance_mm', 0.1))
+        found = [n for n in names if n in by_name]
+        missing = [n for n in names if n not in by_name]
+        g = {'nets_declared': len(names), 'found': found, 'missing': missing,
+             'tolerance_mm': tol, 'mode': spec.get('mode')}
+        if len(found) < 2:
+            out[gname] = dict(g, ran=False, reason=(
+                f'fewer than 2 of its {len(names)} net(s) are on the board'
+                + (f" (missing: {', '.join(missing)})" if missing else '')))
+            continue
+        members, unmeasured = {}, {}
+        for n in found:
+            m, why = net_length_floor(pcb_data, by_name[n])
+            if m is None:
+                unmeasured[n] = why
+            else:
+                members[n] = m
+        if len(members) < 2:
+            out[gname] = dict(g, ran=False, unmeasured=unmeasured, reason=(
+                f'fewer than 2 of its nets have a floor (a net needs copper '
+                f'pads on two parts): {len(members)} of {len(found)} found'))
+            continue
+        raw = {n: m.pop('_raw') for n, m in members.items()}
+        longest = max(sorted(raw), key=raw.get)
+        shortest = min(sorted(raw), key=raw.get)
+        hi = raw[longest]
+        ps = {'outer': {'layer': outer, 'ps': round(hi * ps_mm['outer'], 1)},
+              'inner': ({'layer': inner, 'ps': round(hi * ps_mm['inner'], 1)}
+                        if inner else None)}
+        out[gname] = dict(
+            g, ran=True, reason=None, members=members, unmeasured=unmeasured,
+            longest_floor_mm=round(hi, 3), longest_net=longest,
+            shortest_floor_mm=round(raw[shortest], 3), shortest_net=shortest,
+            spread_mm=round(hi - raw[shortest], 3),
+            copper_to_add_mm=round(sum(hi - v for v in raw.values()), 3),
+            longest_floor_ps=ps)
+    ran = any(g['ran'] for g in out.values())
+    return dict(base, ran=ran, groups=out, velocity=velocity,
+                reason=None if ran else (
+                    'no group had 2 or more members with a floor'
+                    if out else 'the file declares no group'))
+
+
 # ------------------------------------------------------------- the document
 
-def placement_terms(pcb_data, pcb_file, *, clearance=None, intent=None) -> dict:
-    """All six terms for one board."""
+def placement_terms(pcb_data, pcb_file, *, clearance=None, intent=None,
+                    length_groups=None, length_groups_source=None) -> dict:
+    """All six terms for one board, and the report-only `length_groups`
+    section (#1252), which is not a term: `length_groups` is the loaded
+    `--length-groups` file, None when none was given."""
     if clearance is None:
         try:
             import list_nets
@@ -738,7 +1041,9 @@ def placement_terms(pcb_data, pcb_file, *, clearance=None, intent=None) -> dict:
             'segments': len(getattr(pcb_data, 'segments', ()) or ()),
             'clearance': clearance,
             'term_order': list(TERM_ORDER),
-            'terms': terms}
+            'terms': terms,
+            'length_groups': length_group_floors(
+                pcb_data, length_groups, source=length_groups_source)}
 
 
 # --------------------------------------------------------------- comparison
@@ -871,6 +1176,14 @@ def build_parser():
                         "election infers, and says so")
     p.add_argument('--clearance', type=float,
                    help="the board's own floor is read when this is omitted")
+    p.add_argument('--length-groups', metavar='JSON',
+                   help='JSON FILE of {"group": {"nets": [...], '
+                        '"tolerance_mm": 0.1, "mode": "pin_pair"}} -- the '
+                        'board_score / check_complete format. Fills the '
+                        'REPORT-ONLY `length_groups` section (#1252): each '
+                        "group's length-floor spread before routing. Not a "
+                        'term: it never enters `compare_terms`. A path that '
+                        'is not a readable file of that shape exits 2')
     return p
 
 
@@ -887,6 +1200,16 @@ def main(argv=None) -> int:
         except Exception as exc:                             # noqa: BLE001
             print(f'--intent: {type(exc).__name__}: {exc}', file=sys.stderr)
             return 2
+    groups = None
+    if args.length_groups:
+        # Loud, like --intent: board_score reads a missing file as "ungraded"
+        # and exits 0, and a mistyped path then looks like a measured board.
+        try:
+            groups = load_length_groups(args.length_groups)
+        except Exception as exc:                             # noqa: BLE001
+            print(f'--length-groups: {type(exc).__name__}: {exc}',
+                  file=sys.stderr)
+            return 2
     # STDOUT IS THE DOCUMENT. The quench and the parser both print warnings,
     # and a caller json.loads() this whole stream -- `board_context.main` does
     # the same for the same reason.
@@ -899,7 +1222,10 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 3
         doc = placement_terms(pcb, args.board, clearance=args.clearance,
-                              intent=intent)
+                              intent=intent, length_groups=groups,
+                              length_groups_source=(
+                                  os.path.abspath(args.length_groups)
+                                  if args.length_groups else None))
     text = json.dumps(doc, indent=2, sort_keys=True)
     if args.json:
         with open(args.json, 'w', encoding='utf-8') as fh:

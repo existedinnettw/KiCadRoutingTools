@@ -4440,7 +4440,9 @@ def generate_plane_drops(footprint: Footprint,
     """
     fp_pads = [p for p in footprint.pads if p.net_id]
     counts = Counter(p.net_name for p in fp_pads)
-    zone_ids = {z.net_id for z in (pcb_data.zones or []) if z.net_id}
+    from kicad_parser import pour_zones
+    # A net that POURS (a teardrop, #1164, is routing output, not a pour).
+    zone_ids = {z.net_id for z in pour_zones(pcb_data.zones) if z.net_id}
     drop_ids: Set[int] = set()
     for p in fp_pads:
         if net_filter is not None:

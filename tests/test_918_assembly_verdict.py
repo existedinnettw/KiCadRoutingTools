@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """`board_score`'s assembly component must read the VERDICT, not one conjunct (#918).
 
-`check_assembly` decides NOT BUILDABLE on eight conjuncts
+`check_assembly` decides NOT BUILDABLE on ten conjuncts
 (`py_tools/check_assembly.py`)::
 
     not_buildable = bool(g['blocking'] or locked_contact or stack_groups
                          or g['containment_blocking']
                          or courtyard_gating or off_outline_pads or mating
-                         or pin_hits)
+                         or pin_hits or tp_gating or edge_band_gating)
 
-(the last three since #1096, #1098 and fa10 P1's #1212). `blocking` is the FIRST of them and means "pad intersections". `board_score`'s
+(the last five since #1096, #1098, fa10 P1's #1212, #1250 and #1255). `blocking` is the FIRST of them and means "pad intersections". `board_score`'s
 `score_assembly` read that scalar alone and accepted `rc in (0, 4)`, so a board
 that is unbuildable through any of the other four contributed **0** to the
 number the whole placement/routing loop ranks and stops on.
@@ -219,15 +219,19 @@ def main():
              'locked_contacts': 0, 'coincident_origins': 3,
              'containment_blocking': 5, 'courtyard_blocking_gating': None,
              'oob_pad_copper_gating_count': 0, 'mating_keepout_count': 0,
-             'pin_in_courtyard': 0}, 4)
+             'pin_in_courtyard': 0, 'testpoint_covered_gating': None,
+             'body_edge_band_gating': 0}, 4)
         check('count is 1, not 8', r.get('count') == 1,
               f"count={r.get('count')!r} basis={r.get('count_basis')!r}")
         check('...and the basis says WHY it is not a sum',
               'not one currency' in (r.get('count_basis') or '')
               and 'coincident_origins' in (r.get('count_basis') or ''),
               repr(r.get('count_basis')))
-        check('the unarmed fifth conjunct is named, never counted as 0',
-              r.get('conjuncts_unmeasured') == ['courtyard_blocking_gating']
+        # Both moved-vs-baseline conjuncts: the courtyard gate (fifth) and,
+        # since #1250, a test point a move left under a body (ninth).
+        check('the unarmed baseline conjuncts are named, never counted as 0',
+              r.get('conjuncts_unmeasured') == ['courtyard_blocking_gating',
+                                                'testpoint_covered_gating']
               and r.get('courtyard_gating_armed') is False
               and '--baseline' in (r.get('courtyard_gating_reason') or ''),
               f"unmeasured={r.get('conjuncts_unmeasured')!r}")
@@ -267,14 +271,17 @@ def main():
         # #1096 made pad copper off the outline the third, #1098 a part on a
         # plug's mating region the fourth, fa10 P1 (#1212) a part on a pin
         # frame's drilled pin the fifth, and #1183 the courtyard gate the
-        # sixth -- board_score now arms it when handed --baseline.
-        print('the six conjuncts that can REALLY fire at blocking 0 are '
+        # sixth -- board_score now arms it when handed --baseline -- and
+        # #1250 a test point a moved member left under a body the seventh,
+        # and #1255 a body inside a DECLARED body-to-edge band the eighth.
+        print('the eight conjuncts that can REALLY fire at blocking 0 are '
               'named')
         check('locked_contacts is not among them',
               tuple(board_score.ASSEMBLY_LIVE_CONJUNCTS)
               == ('coincident_origins', 'containment_blocking',
                   'oob_pad_copper_gating_count', 'mating_keepout_count',
-                  'pin_in_courtyard', 'courtyard_blocking_gating'),
+                  'pin_in_courtyard', 'courtyard_blocking_gating',
+                  'testpoint_covered_gating', 'body_edge_band_gating'),
               repr(board_score.ASSEMBLY_LIVE_CONJUNCTS))
         r = board_score.assembly_component(
             {'blocking': 0, 'buildable': False, 'verdict': 'NOT BUILDABLE',
@@ -290,7 +297,8 @@ def main():
              'locked_contacts': 0, 'coincident_origins': 0,
              'containment_blocking': 0, 'courtyard_blocking_gating': 0,
              'oob_pad_copper_gating_count': 0, 'mating_keepout_count': 0,
-             'pin_in_courtyard': 0,
+             'pin_in_courtyard': 0, 'testpoint_covered_gating': 0,
+             'body_edge_band_gating': 0,
              'courtyard_gating_basis': 'moved-vs-baseline'}, 0)
         check('a doc produced WITH --baseline reports the conjunct as armed',
               r.get('courtyard_gating_armed') is True
