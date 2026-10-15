@@ -1712,9 +1712,12 @@ def main():
     import routing_defaults as defaults
     parser.add_argument('--extension', type=float, default=defaults.QFN_EXTENSION,
                         help='Extension past pad edge before bend (mm)')
-    parser.add_argument('--clearance', type=float, default=defaults.QFN_CLEARANCE,
+    parser.add_argument('--clearance', type=float, default=None,
                         help='Min clearance to other-net pads (mm); stubs that '
-                             'would graze a foreign pad are shortened or dropped')
+                             'would graze a foreign pad are shortened or dropped. '
+                             f'Default {defaults.QFN_CLEARANCE} (the writeback lowers '
+                             'the project floor to it); with --no-fix-drc-settings, '
+                             "the board's Default net-class clearance")
     parser.add_argument('--nets', '-n', nargs='*',
                         help='Net patterns to include')
     parser.add_argument('--grid-step', type=float, default=defaults.GRID_STEP,
@@ -1767,6 +1770,25 @@ def main():
     args = __import__("cli_nets").pin_dash_digit_values(parser).parse_args()
     from fix_kicad_drc_settings import warn_if_missing_project_floor
     warn_if_missing_project_floor(args.pcb)  # #441: a dropped sibling .kicad_pro strands the DRC floor
+    # With --no-fix-drc-settings the board's rules stay binding: nothing lowers
+    # the project floor to the fanout's clearance, so stubs graded at the generic
+    # 0.1mm default ship as KiCad clearance violations against nearby foreign
+    # pads (a crystal or decap next to a 0.2mm-class LQFP). Default to the
+    # board's own Default net-class clearance there, as route.py does.
+    if args.clearance is None:
+        _nc = None
+        if getattr(args, 'no_fix_drc_settings', False):
+            try:
+                from list_nets import board_default_netclass_clearance
+                _nc = board_default_netclass_clearance(args.pcb)
+            except Exception:
+                _nc = None
+        if _nc:
+            args.clearance = _nc
+            print(f"--clearance not given with --no-fix-drc-settings; using the "
+                  f"board's Default net-class clearance {_nc}mm.")
+        else:
+            args.clearance = defaults.QFN_CLEARANCE
     # This front registers --clearance-ceiling (add_fab_tier_args does) and used
     # to IGNORE it, so the spelling CLAUDE.md tells a chain to use did nothing.
     __import__('fab_tiers').apply_clearance_ceiling(args, 'qfn_fanout')
