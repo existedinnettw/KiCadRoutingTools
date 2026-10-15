@@ -3905,7 +3905,7 @@ Examples:
     # --overwrite writes over the input: keep the original board (and its
     # project) for the no-net-loss retry, which must start from the same copper.
     _retry_src, _snap_dir = args.input_file, None
-    if not args.dry_run and os.path.abspath(args.input_file) == os.path.abspath(args.output_file):
+    if not args.dry_run and _same_file(args.input_file, args.output_file):
         import tempfile
         from copy_board import copy_board
         _snap_dir = tempfile.mkdtemp(prefix='repair_planes_input_')
@@ -4119,12 +4119,9 @@ Examples:
                 _summary["sense_branches"] = _sense
         except Exception as _se:                                # noqa: BLE001
             print(f"  (sense-branch summary skipped: {type(_se).__name__}: {_se})")
-    # Signal nets this run disconnected (issue #293) outrank an incomplete
-    # plane: `complete` is False and `status` is "regressed".
-    _summary["disconnected_signal_nets"] = list(LAST_REGRESSED_SIGNAL_NETS)
-    if LAST_REGRESSED_SIGNAL_NETS:
-        _summary["complete"] = False
-        _summary["status"] = "regressed"
+    # Lost nets (issue #293) outrank an incomplete plane: `complete` is
+    # False and `status` is "regressed".
+    _mark_losses(_summary)
     # `complete` otherwise keeps its route_summary meaning: the run FINISHED
     # (it is never a partial tally -- the CLI has no cancel source, so it
     # finished or raised). Whether the plane pads are connected is `status`
@@ -4218,6 +4215,29 @@ Examples:
         finish_design_rules(args, 4)
         return 4
     return finish_design_rules(args, 0)
+
+
+def _mark_losses(summary):
+    """Name the lost nets in the summary. Either loss list means the written
+    board is missing nets (and main() exits 4): never call it complete."""
+    summary["disconnected_signal_nets"] = list(LAST_REGRESSED_SIGNAL_NETS)
+    if LAST_REGRESSED_SIGNAL_NETS or LAST_RIPPED_STILL_OPEN:
+        summary["complete"] = False
+        summary["status"] = "regressed"
+    return summary
+
+
+def _same_file(a, b):
+    """True when two paths name the same file: same inode when both exist
+    (symlinks, hard links, case-only spellings on case-insensitive file
+    systems), else the same resolved, case-normalised path."""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.abspath(p)))
+    return norm(a) == norm(b)
 
 
 def _no_net_loss_retry(args, kwargs, first_result, retry_input=None, ledger_before=None):
