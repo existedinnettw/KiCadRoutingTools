@@ -20,6 +20,8 @@ records the env it ran under and the lost nets it reports.
   7. the clearance ledger ends at the kept pass's state, and the retry starts
      from the state before the first pass
   8. a winning retry's side artifacts (route trace) replace the first pass's
+  9. input/output aliasing is detected by file identity (symlink, hard link)
+ 10. the summary is incomplete when either loss list is non-empty
 
 Run:  python3 tests/test_repair_planes_no_net_loss.py
 """
@@ -150,6 +152,27 @@ def main():
     run_case('ledger-first', [(['/A'], [], 'first', 0.1), (['/A', '/B'], [], 'retry', 0.05)],
              ledger_before=0.2)
     check('ledger: discarded retry\'s 0.05 does not survive', cl.get_min() == 0.1, cl.get_min())
+
+    # 9. aliasing: same file under another name
+    with tempfile.TemporaryDirectory() as tmp:
+        a = os.path.join(tmp, 'a.kicad_pcb')
+        open(a, 'w').close()
+        sym, hard = os.path.join(tmp, 's.kicad_pcb'), os.path.join(tmp, 'h.kicad_pcb')
+        os.symlink(a, sym)
+        os.link(a, hard)
+        other = os.path.join(tmp, 'b.kicad_pcb')
+        check('alias: symlink', rp._same_file(a, sym))
+        check('alias: hard link', rp._same_file(a, hard))
+        check('alias: path spelling', rp._same_file(a, os.path.join(tmp, '.', 'a.kicad_pcb')))
+        check('alias: missing output differs', not rp._same_file(a, other))
+        check('alias: missing output via symlinked dir',
+              rp._same_file(os.path.join(tmp, 'x.kicad_pcb'), os.path.join(tmp, '.', 'x.kicad_pcb')))
+
+    # 10. summary status from both loss lists
+    for reg, still, want in (([], [], True), (['/A'], [], False), ([], ['/C'], False)):
+        rp.LAST_REGRESSED_SIGNAL_NETS, rp.LAST_RIPPED_STILL_OPEN = reg, still
+        sm = rp._mark_losses({"complete": True, "status": "ok"})
+        check('summary %s/%s' % (reg, still), sm["complete"] is want and (sm["status"] == "ok") is want, sm)
 
     if FAILS:
         print("FAIL:\n  " + "\n  ".join(FAILS))
