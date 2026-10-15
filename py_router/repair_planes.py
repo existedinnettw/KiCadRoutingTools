@@ -3840,9 +3840,26 @@ Examples:
         add_teardrops=args.add_teardrops,
         same_net_pad_clearance=args.same_net_pad_clearance
     )
-    _rdp_result = repair_planes(input_file=args.input_file,
-                                output_file=args.output_file, **_rdp_kwargs)
-    _rdp_result = _no_net_loss_retry(args, _rdp_kwargs, _rdp_result)
+    import clearance_ledger as _cl_retry
+    _ledger_before = _cl_retry.get_min()
+    # --overwrite writes over the input: keep the original board (and its
+    # project) for the no-net-loss retry, which must start from the same copper.
+    _retry_src, _snap_dir = args.input_file, None
+    if not args.dry_run and os.path.abspath(args.input_file) == os.path.abspath(args.output_file):
+        import tempfile
+        from copy_board import copy_board
+        _snap_dir = tempfile.mkdtemp(prefix='repair_planes_input_')
+        _retry_src = os.path.join(_snap_dir, os.path.basename(args.input_file))
+        copy_board(args.input_file, _retry_src)
+    try:
+        _rdp_result = repair_planes(input_file=args.input_file,
+                                    output_file=args.output_file, **_rdp_kwargs)
+        _rdp_result = _no_net_loss_retry(args, _rdp_kwargs, _rdp_result,
+                                         retry_input=_retry_src, ledger_before=_ledger_before)
+    finally:
+        if _snap_dir:
+            import shutil as _sh_snap
+            _sh_snap.rmtree(_snap_dir, ignore_errors=True)
 
     # Dead-end sweep + gap-snap on the repaired plane copper (issue #84), gated
     # against connectivity + pours so it never breaks a net.
@@ -4133,7 +4150,7 @@ Examples:
     return finish_design_rules(args, 0)
 
 
-def _no_net_loss_retry(args, kwargs, first_result):
+def _no_net_loss_retry(args, kwargs, first_result, retry_input=None, ledger_before=None):
     """Run the repair again without ripping earlier-step copper when the first
     pass disconnected signal nets it started with (issue #293).
 
@@ -4143,7 +4160,14 @@ def _no_net_loss_retry(args, kwargs, first_result):
     rips again) left 11 previously connected nets broken and GND no better.
     Re-running with those rips off keeps every signal net; the result with
     fewer lost nets (ripped-still-open + regressed) is the one written.
+
+    ``retry_input`` is the original board when the first pass overwrote it
+    (--overwrite). ``ledger_before`` is the clearance ledger's minimum before
+    the first pass: the retry starts from it, and the kept pass's ledger state
+    is the one left behind, so a clearance only the discarded pass used never
+    reaches the project floor or the summary.
     """
+    import clearance_ledger as _cl
     if args.dry_run or os.environ.get('KICAD_RIP_PREEXISTING', '1') == '0':
         return first_result
     lost = lambda: set(LAST_REGRESSED_SIGNAL_NETS) | set(LAST_RIPPED_STILL_OPEN)
@@ -4154,6 +4178,11 @@ def _no_net_loss_retry(args, kwargs, first_result):
         LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME
     first_state = (LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY,
                    LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME)
+    first_ledger = _cl.get_min()
+
+    def set_ledger(v):
+        _cl.reset()
+        _cl.record(v)
     print(f"\nNo-net-loss retry: the pass lost {len(first_lost)} signal net(s); "
           f"repairing again without ripping earlier-step copper "
           f"(KICAD_RIP_PREEXISTING=0)...")
@@ -4163,8 +4192,9 @@ def _no_net_loss_retry(args, kwargs, first_result):
     retry_out = os.path.join(tmp_dir, os.path.basename(args.output_file))
     old_env = os.environ.get('KICAD_RIP_PREEXISTING')
     os.environ['KICAD_RIP_PREEXISTING'] = '0'
+    set_ledger(ledger_before)
     try:
-        retry_result = repair_planes(input_file=args.input_file,
+        retry_result = repair_planes(input_file=retry_input or args.input_file,
                                      output_file=retry_out, **kwargs)
     finally:
         if old_env is None:
@@ -4182,6 +4212,7 @@ def _no_net_loss_retry(args, kwargs, first_result):
               f"the first pass.")
         (LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY,
          LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME) = first_state
+        set_ledger(first_ledger)
         return first_result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
