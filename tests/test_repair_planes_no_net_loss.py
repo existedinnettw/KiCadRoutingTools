@@ -19,6 +19,7 @@ records the env it ran under and the lost nets it reports.
   6. the retry reads ``retry_input`` (the original board under --overwrite)
   7. the clearance ledger ends at the kept pass's state, and the retry starts
      from the state before the first pass
+  8. a winning retry's side artifacts (route trace) replace the first pass's
 
 Run:  python3 tests/test_repair_planes_no_net_loss.py
 """
@@ -57,6 +58,8 @@ def make_stub(outcomes, calls, inputs=None, ledgers=None):
         rp.LAST_RIPPED_STILL_OPEN = list(still_open)
         with open(output_file, 'w') as f:
             f.write(text)
+        with open(os.path.splitext(output_file)[0] + '_routetrace.json', 'w') as f:
+            f.write(text)
         return (len(calls), 0)
     return stub
 
@@ -80,6 +83,9 @@ def run_case(name, outcomes, env=None, retry_input=None, ledger_before=None, inp
                                         ledger_before=ledger_before)
             with open(out) as f:
                 text = f.read()
+            with open(os.path.splitext(out)[0] + '_routetrace.json') as f:
+                trace = f.read()
+            check('%s: trace matches the written board' % name, trace == text, (trace, text))
             env_after = os.environ.get('KICAD_RIP_PREEXISTING')
         return calls, res, text, env_after
     finally:
