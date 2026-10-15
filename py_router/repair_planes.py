@@ -79,6 +79,12 @@ LAST_RIPPED_RECONNECT: Optional[Dict] = None
 LAST_RIPPED_STILL_OPEN: List[str] = []
 LAST_RIPPED_CUSTODY: Optional[Dict] = None
 
+# Signal nets that were connected before the pass and are not after it, and
+# that the pass did not rip (issue #293 re-verify). Before this the list only
+# reached a red warning: the summary still said complete/ok and main() exited
+# 0, so a chain shipped the lost nets as a clean step.
+LAST_REGRESSED_SIGNAL_NETS: List[str] = []
+
 # The class map the last repair_planes() run resolved (after its
 # --clearance-ceiling clamp), keyed by net NAME (#1137), for main()'s oracle
 # leg: the oracle re-parses its board, so an id-keyed map could land on other
@@ -982,6 +988,12 @@ def repair_planes(
         zone_clearance = clearance if clearance is not None else defaults.PLANE_ZONE_CLEARANCE
     global LAST_NET_CLEARANCES_BY_NAME
     LAST_NET_CLEARANCES_BY_NAME = {}   # #1137: this run's, set below
+    # Per-run outcome records start empty, so a second run in one process (the
+    # no-net-loss retry in main(), or the GUI) never reports the first's.
+    global LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY, \
+        LAST_REGRESSED_SIGNAL_NETS
+    LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY = [], None, None
+    LAST_REGRESSED_SIGNAL_NETS = []
     from route import _dump_engine_config
     _dump_engine_config('repair_planes', dict(locals()))
     # Board-setup copper-to-edge rule (#338): engine-side so the GUI planes
@@ -2004,7 +2016,6 @@ def repair_planes(
     # (hex_gateway C201/C205 shipped stranded behind a "9/10 reconnected"
     # report) -- the sweep below must verify, and repair, the fill AGAINST the
     # reconnected copper.
-    global LAST_RIPPED_RECONNECT
     LAST_RIPPED_RECONNECT = None
     _casualties = list(dict.fromkeys(ripped_net_ids + partial_ids))
     # GUI passes dry_run=True meaning 'no file write'; routing already
@@ -2375,7 +2386,6 @@ def repair_planes(
                       f"of {len(_casualties)} casualty net(s)"
                       + (f"; {_cust['stub']} refused net(s) kept their escape "
                          f"stub" if _cust.get('stub') else ""))
-                global LAST_RIPPED_CUSTODY
                 LAST_RIPPED_CUSTODY = dict(_cust,
                                            casualties=len(_casualties))
             if _still_open:
@@ -2383,7 +2393,6 @@ def repair_planes(
             # A10: the still-open set is the run's real damage. Publish the
             # NAMES so the summary, the exit code and the ledger can all carry
             # it -- a count in a log line is not a verdict channel.
-            global LAST_RIPPED_STILL_OPEN
             LAST_RIPPED_STILL_OPEN = [
                 (pcb_data.nets[_cid].name if _cid in pcb_data.nets
                  else f"net_{_cid}") for _cid in _still_open]
@@ -3205,6 +3214,7 @@ def repair_planes(
                   f"(issue #293) - re-route them before shipping:{RESET}")
             for _nm, _ndisc in _regressed_293:
                 print(f"  {RED}{_nm}: {_ndisc} pad(s) now disconnected{RESET}")
+        LAST_REGRESSED_SIGNAL_NETS = [_nm for _nm, _ in _regressed_293]
 
     # Print summary
     print(f"\n{'='*60}")
@@ -3856,9 +3866,7 @@ Examples:
     # GUI's (the planes tab's Cancel button); the CLI passes neither. There is
     # deliberately no wall-clock budget -- no result this tool produces may
     # depend on timing.
-    _rdp_result = repair_planes(
-        input_file=args.input_file,
-        output_file=args.output_file,
+    _rdp_kwargs = dict(
         layer_costs=(list(args.layer_costs) if args.layer_costs else None),
 
         net_names=net_names,
@@ -3894,6 +3902,9 @@ Examples:
         add_teardrops=args.add_teardrops,
         same_net_pad_clearance=args.same_net_pad_clearance
     )
+    _rdp_result = repair_planes(input_file=args.input_file,
+                                output_file=args.output_file, **_rdp_kwargs)
+    _rdp_result = _no_net_loss_retry(args, _rdp_kwargs, _rdp_result)
 
     # Dead-end sweep + gap-snap on the repaired plane copper (issue #84), gated
     # against connectivity + pours so it never breaks a net.
@@ -4093,10 +4104,16 @@ Examples:
                 _summary["sense_branches"] = _sense
         except Exception as _se:                                # noqa: BLE001
             print(f"  (sense-branch summary skipped: {type(_se).__name__}: {_se})")
-    # `complete` keeps its route_summary meaning: the run FINISHED (it is never
-    # a partial tally -- the CLI has no cancel source, so it finished or
-    # raised). Whether the plane pads are connected is `status` and the
-    # failure keys above.
+    # Signal nets this run disconnected (issue #293) outrank an incomplete
+    # plane: `complete` is False and `status` is "regressed".
+    _summary["disconnected_signal_nets"] = list(LAST_REGRESSED_SIGNAL_NETS)
+    if LAST_REGRESSED_SIGNAL_NETS:
+        _summary["complete"] = False
+        _summary["status"] = "regressed"
+    # `complete` otherwise keeps its route_summary meaning: the run FINISHED
+    # (it is never a partial tally -- the CLI has no cancel source, so it
+    # finished or raised). Whether the plane pads are connected is `status`
+    # and the failure keys above.
     _summary.setdefault("complete", True)
     _summary.setdefault("status", "ok")
     try:                       # #653: env knobs into the machine-readable
@@ -4177,7 +4194,69 @@ Examples:
               "read this run as clean.")
         finish_design_rules(args, 4)     # the line only: exit 4 outranks 3
         return 4
+    if LAST_REGRESSED_SIGNAL_NETS:
+        print(f"{RED}SIGNAL NETS LOST ({len(LAST_REGRESSED_SIGNAL_NETS)}): "
+              f"{', '.join(LAST_REGRESSED_SIGNAL_NETS)}{RESET}")
+        print("  These nets were connected on the input board and are not on the "
+              "written one (issue #293). Re-route them before shipping; do not "
+              "read this run as clean.")
+        finish_design_rules(args, 4)
+        return 4
     return finish_design_rules(args, 0)
+
+
+def _no_net_loss_retry(args, kwargs, first_result):
+    """Run the repair again without ripping earlier-step copper when the first
+    pass disconnected signal nets it started with (issue #293).
+
+    Pad repair goes through route.py's rip ladder, which may rip pre-existing
+    signal nets (custody-backed, KICAD_RIP_PREEXISTING). Measured on a dense
+    2-layer LQFP board: the cascade (one rip blocking the next reroute, which
+    rips again) left 11 previously connected nets broken and GND no better.
+    Re-running with those rips off keeps every signal net; the result with
+    fewer lost nets (ripped-still-open + regressed) is the one written.
+    """
+    if args.dry_run or os.environ.get('KICAD_RIP_PREEXISTING', '1') == '0':
+        return first_result
+    lost = lambda: set(LAST_REGRESSED_SIGNAL_NETS) | set(LAST_RIPPED_STILL_OPEN)
+    first_lost = lost()
+    if not first_lost:
+        return first_result
+    global LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY, \
+        LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME
+    first_state = (LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY,
+                   LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME)
+    print(f"\nNo-net-loss retry: the pass lost {len(first_lost)} signal net(s); "
+          f"repairing again without ripping earlier-step copper "
+          f"(KICAD_RIP_PREEXISTING=0)...")
+    import shutil
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix='repair_planes_norip_')
+    retry_out = os.path.join(tmp_dir, os.path.basename(args.output_file))
+    old_env = os.environ.get('KICAD_RIP_PREEXISTING')
+    os.environ['KICAD_RIP_PREEXISTING'] = '0'
+    try:
+        retry_result = repair_planes(input_file=args.input_file,
+                                     output_file=retry_out, **kwargs)
+    finally:
+        if old_env is None:
+            os.environ.pop('KICAD_RIP_PREEXISTING', None)
+        else:
+            os.environ['KICAD_RIP_PREEXISTING'] = old_env
+    retry_lost = lost()
+    try:
+        if len(retry_lost) < len(first_lost) and os.path.isfile(retry_out):
+            shutil.copyfile(retry_out, args.output_file)
+            print(f"No-net-loss retry: kept (lost {len(retry_lost)} net(s) instead "
+                  f"of {len(first_lost)}).")
+            return retry_result
+        print(f"No-net-loss retry: not better (lost {len(retry_lost)}); keeping "
+              f"the first pass.")
+        (LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY,
+         LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME) = first_state
+        return first_result
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # Naming (#562): this module's engine used to be called route_planes,
