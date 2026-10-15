@@ -4204,7 +4204,15 @@ def _no_net_loss_retry(args, kwargs, first_result, retry_input=None, ledger_befo
     retry_lost = lost()
     try:
         if len(retry_lost) < len(first_lost) and os.path.isfile(retry_out):
-            shutil.copyfile(retry_out, args.output_file)
+            # The board and every artifact the retry wrote beside it (e.g. the
+            # KICAD_ROUTE_TRACE <stem>_routetrace.json), so nothing shipped
+            # still describes the discarded pass. retry_out has the output's
+            # basename, so names carry over unchanged.
+            stem = os.path.splitext(os.path.basename(retry_out))[0]
+            out_dir = os.path.dirname(os.path.abspath(args.output_file))
+            for name in os.listdir(tmp_dir):
+                if name.startswith(stem):
+                    shutil.copyfile(os.path.join(tmp_dir, name), os.path.join(out_dir, name))
             print(f"No-net-loss retry: kept (lost {len(retry_lost)} net(s) instead "
                   f"of {len(first_lost)}).")
             return retry_result
