@@ -79,6 +79,12 @@ LAST_RIPPED_RECONNECT: Optional[Dict] = None
 LAST_RIPPED_STILL_OPEN: List[str] = []
 LAST_RIPPED_CUSTODY: Optional[Dict] = None
 
+# Signal nets that were connected before the pass and are not after it, and
+# that the pass did not rip (issue #293 re-verify). Before this the list only
+# reached a red warning: the summary still said complete/ok and main() exited
+# 0, so a chain shipped the lost nets as a clean step.
+LAST_REGRESSED_SIGNAL_NETS: List[str] = []
+
 # The class map the last repair_planes() run resolved (after its
 # --clearance-ceiling clamp), keyed by net NAME (#1137), for main()'s oracle
 # leg: the oracle re-parses its board, so an id-keyed map could land on other
@@ -1020,6 +1026,12 @@ def _repair_planes_all(
         zone_clearance = clearance if clearance is not None else defaults.PLANE_ZONE_CLEARANCE
     global LAST_NET_CLEARANCES_BY_NAME
     LAST_NET_CLEARANCES_BY_NAME = {}   # #1137: this run's, set below
+    # Per-run outcome records start empty, so a second run in one process (the
+    # no-net-loss retry in main(), or the GUI) never reports the first's.
+    global LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY, \
+        LAST_REGRESSED_SIGNAL_NETS
+    LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY = [], None, None
+    LAST_REGRESSED_SIGNAL_NETS = []
     from route import _dump_engine_config
     _dump_engine_config('repair_planes', dict(locals()))
     # Board-setup copper-to-edge rule (#338): engine-side so the GUI planes
@@ -2122,7 +2134,6 @@ def _repair_planes_all(
     # (hex_gateway C201/C205 shipped stranded behind a "9/10 reconnected"
     # report) -- the sweep below must verify, and repair, the fill AGAINST the
     # reconnected copper.
-    global LAST_RIPPED_RECONNECT
     LAST_RIPPED_RECONNECT = None
     _casualties = list(dict.fromkeys(ripped_net_ids + partial_ids))
     # GUI passes dry_run=True meaning 'no file write'; routing already
@@ -2492,7 +2503,6 @@ def _repair_planes_all(
                       f"of {len(_casualties)} casualty net(s)"
                       + (f"; {_cust['stub']} refused net(s) kept their escape "
                          f"stub" if _cust.get('stub') else ""))
-                global LAST_RIPPED_CUSTODY
                 LAST_RIPPED_CUSTODY = dict(_cust,
                                            casualties=len(_casualties))
             if _still_open:
@@ -2500,7 +2510,6 @@ def _repair_planes_all(
             # A10: the still-open set is the run's real damage. Publish the
             # NAMES so the summary, the exit code and the ledger can all carry
             # it -- a count in a log line is not a verdict channel.
-            global LAST_RIPPED_STILL_OPEN
             LAST_RIPPED_STILL_OPEN = [
                 (pcb_data.nets[_cid].name if _cid in pcb_data.nets
                  else f"net_{_cid}") for _cid in _still_open]
@@ -3340,6 +3349,7 @@ def _repair_planes_all(
                   f"(issue #293) - re-route them before shipping:{RESET}")
             for _nm, _ndisc in _regressed_293:
                 print(f"  {RED}{_nm}: {_ndisc} pad(s) now disconnected{RESET}")
+        LAST_REGRESSED_SIGNAL_NETS = [_nm for _nm, _ in _regressed_293]
 
     # Print summary
     print(f"\n{'='*60}")
@@ -4038,51 +4048,68 @@ Examples:
     # GUI's (the planes tab's Cancel button); the CLI passes neither. There is
     # deliberately no wall-clock budget -- no result this tool produces may
     # depend on timing.
+    _rdp_kwargs = dict(
+        via_span=args.via_span, via_span_type=args.via_span_type,
+        layer_costs=(list(args.layer_costs) if args.layer_costs else None),
+
+        net_names=net_names,
+        plane_layers=plane_layers,
+        track_width=args.track_width,
+        clearance=args.clearance,
+        zone_clearance=args.zone_clearance,
+        grid_step=args.grid_step,
+        analysis_grid_step=args.analysis_grid_step,
+        ripup_blocker_select=args.ripup_blocker_select,
+        max_track_width=args.max_track_width,
+        min_track_width=args.min_track_width,
+        track_via_clearance=args.track_via_clearance,
+        hole_to_hole_clearance=args.hole_to_hole_clearance,
+        board_edge_clearance=args.board_edge_clearance,
+        via_size=args.via_size,
+        via_drill=args.via_drill,
+        via_from_class=not _vs_explicit,
+        max_iterations=args.max_iterations,
+        verbose=args.verbose,
+        dry_run=args.dry_run,
+        debug_lines=args.debug_lines,
+        routing_layers=args.layers,
+        repair_pads=args.repair_pads,
+        max_search_radius=args.max_search_radius,
+        rip_blocker_nets=args.rip_blocker_nets,
+        max_rip_nets=args.max_rip_nets,
+        reroute_ripped_nets=args.reroute_ripped_nets,
+        power_nets=args.power_nets,
+        power_nets_widths=args.power_nets_widths,
+        no_bga_zone=args.no_bga_zone,
+        clamp_netclasses=args._clamp_netclasses,
+        clearance_ceiling=args._clearance_ceiling,
+        add_teardrops=args.add_teardrops,
+        same_net_pad_clearance=args.same_net_pad_clearance
+    )
+    import clearance_ledger as _cl_retry
+    _ledger_before = _cl_retry.get_min()
+    # --overwrite writes over the input: keep the original board (and its
+    # project) for the no-net-loss retry, which must start from the same copper.
+    _retry_src, _snap_dir = args.input_file, None
+    if not args.dry_run and _same_file(args.input_file, args.output_file):
+        import tempfile
+        from copy_board import copy_board
+        _snap_dir = tempfile.mkdtemp(prefix='repair_planes_input_')
+        _retry_src = os.path.join(_snap_dir, os.path.basename(args.input_file))
+        copy_board(args.input_file, _retry_src)
     from via_span import SpanError as _SpanError
     try:
-        _rdp_result = repair_planes(
-            via_span=args.via_span, via_span_type=args.via_span_type,
-            input_file=args.input_file,
-            output_file=args.output_file,
-            layer_costs=(list(args.layer_costs) if args.layer_costs else None),
-
-            net_names=net_names,
-            plane_layers=plane_layers,
-            track_width=args.track_width,
-            clearance=args.clearance,
-            zone_clearance=args.zone_clearance,
-            grid_step=args.grid_step,
-            analysis_grid_step=args.analysis_grid_step,
-            ripup_blocker_select=args.ripup_blocker_select,
-            max_track_width=args.max_track_width,
-            min_track_width=args.min_track_width,
-            track_via_clearance=args.track_via_clearance,
-            hole_to_hole_clearance=args.hole_to_hole_clearance,
-            board_edge_clearance=args.board_edge_clearance,
-            via_size=args.via_size,
-            via_drill=args.via_drill,
-            via_from_class=not _vs_explicit,
-            max_iterations=args.max_iterations,
-            verbose=args.verbose,
-            dry_run=args.dry_run,
-            debug_lines=args.debug_lines,
-            routing_layers=args.layers,
-            repair_pads=args.repair_pads,
-            max_search_radius=args.max_search_radius,
-            rip_blocker_nets=args.rip_blocker_nets,
-            max_rip_nets=args.max_rip_nets,
-            reroute_ripped_nets=args.reroute_ripped_nets,
-            power_nets=args.power_nets,
-            power_nets_widths=args.power_nets_widths,
-            no_bga_zone=args.no_bga_zone,
-            clamp_netclasses=args._clamp_netclasses,
-            clearance_ceiling=args._clearance_ceiling,
-            add_teardrops=args.add_teardrops,
-            same_net_pad_clearance=args.same_net_pad_clearance
-        )
+        _rdp_result = repair_planes(input_file=args.input_file,
+                                    output_file=args.output_file, **_rdp_kwargs)
+        _rdp_result = _no_net_loss_retry(args, _rdp_kwargs, _rdp_result,
+                                         retry_input=_retry_src, ledger_before=_ledger_before)
     except _SpanError as exc:
         print(f"Error: {exc}")
         return 1
+    finally:
+        if _snap_dir:
+            import shutil as _sh_snap
+            _sh_snap.rmtree(_snap_dir, ignore_errors=True)
 
     # Dead-end sweep + gap-snap on the repaired plane copper (issue #84), gated
     # against connectivity + pours so it never breaks a net.
@@ -4307,10 +4334,13 @@ Examples:
                 print(f"  {_tvl}")
         except Exception as _tve:                               # noqa: BLE001
             print(f"  (tap-via census skipped: {type(_tve).__name__}: {_tve})")
-    # `complete` keeps its route_summary meaning: the run FINISHED (it is never
-    # a partial tally -- the CLI has no cancel source, so it finished or
-    # raised). Whether the plane pads are connected is `status` and the
-    # failure keys above.
+    # Lost nets (issue #293) outrank an incomplete plane: `complete` is
+    # False and `status` is "regressed".
+    _mark_losses(_summary)
+    # `complete` otherwise keeps its route_summary meaning: the run FINISHED
+    # (it is never a partial tally -- the CLI has no cancel source, so it
+    # finished or raised). Whether the plane pads are connected is `status`
+    # and the failure keys above.
     _summary.setdefault("complete", True)
     _summary.setdefault("status", "ok")
     try:                       # #653: env knobs into the machine-readable
@@ -4391,7 +4421,114 @@ Examples:
               "read this run as clean.")
         finish_design_rules(args, 4)     # the line only: exit 4 outranks 3
         return 4
+    if LAST_REGRESSED_SIGNAL_NETS:
+        print(f"{RED}SIGNAL NETS LOST ({len(LAST_REGRESSED_SIGNAL_NETS)}): "
+              f"{', '.join(LAST_REGRESSED_SIGNAL_NETS)}{RESET}")
+        print("  These nets were connected on the input board and are not on the "
+              "written one (issue #293). Re-route them before shipping; do not "
+              "read this run as clean.")
+        finish_design_rules(args, 4)
+        return 4
     return finish_design_rules(args, 0)
+
+
+def _mark_losses(summary):
+    """Name the lost nets in the summary. Either loss list means the written
+    board is missing nets (and main() exits 4): never call it complete."""
+    summary["disconnected_signal_nets"] = list(LAST_REGRESSED_SIGNAL_NETS)
+    if LAST_REGRESSED_SIGNAL_NETS or LAST_RIPPED_STILL_OPEN:
+        summary["complete"] = False
+        summary["status"] = "regressed"
+    return summary
+
+
+def _same_file(a, b):
+    """True when two paths name the same file: same inode when both exist
+    (symlinks, hard links, case-only spellings on case-insensitive file
+    systems), else the same resolved, case-normalised path."""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.abspath(p)))
+    return norm(a) == norm(b)
+
+
+def _no_net_loss_retry(args, kwargs, first_result, retry_input=None, ledger_before=None):
+    """Run the repair again without ripping earlier-step copper when the first
+    pass disconnected signal nets it started with (issue #293).
+
+    Pad repair goes through route.py's rip ladder, which may rip pre-existing
+    signal nets (custody-backed, KICAD_RIP_PREEXISTING). Measured on a dense
+    2-layer LQFP board: the cascade (one rip blocking the next reroute, which
+    rips again) left 11 previously connected nets broken and GND no better.
+    Re-running with those rips off keeps every signal net; the result with
+    fewer lost nets (ripped-still-open + regressed) is the one written.
+
+    ``retry_input`` is the original board when the first pass overwrote it
+    (--overwrite). ``ledger_before`` is the clearance ledger's minimum before
+    the first pass: the retry starts from it, and the kept pass's ledger state
+    is the one left behind, so a clearance only the discarded pass used never
+    reaches the project floor or the summary.
+    """
+    import clearance_ledger as _cl
+    if args.dry_run or os.environ.get('KICAD_RIP_PREEXISTING', '1') == '0':
+        return first_result
+    lost = lambda: set(LAST_REGRESSED_SIGNAL_NETS) | set(LAST_RIPPED_STILL_OPEN)
+    first_lost = lost()
+    if not first_lost:
+        return first_result
+    global LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY, \
+        LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME
+    first_state = (LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY,
+                   LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME)
+    first_ledger = _cl.get_min()
+
+    def set_ledger(v):
+        _cl.reset()
+        _cl.record(v)
+    print(f"\nNo-net-loss retry: the pass lost {len(first_lost)} signal net(s); "
+          f"repairing again without ripping earlier-step copper "
+          f"(KICAD_RIP_PREEXISTING=0)...")
+    import shutil
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix='repair_planes_norip_')
+    retry_out = os.path.join(tmp_dir, os.path.basename(args.output_file))
+    old_env = os.environ.get('KICAD_RIP_PREEXISTING')
+    os.environ['KICAD_RIP_PREEXISTING'] = '0'
+    set_ledger(ledger_before)
+    try:
+        retry_result = repair_planes(input_file=retry_input or args.input_file,
+                                     output_file=retry_out, **kwargs)
+    finally:
+        if old_env is None:
+            os.environ.pop('KICAD_RIP_PREEXISTING', None)
+        else:
+            os.environ['KICAD_RIP_PREEXISTING'] = old_env
+    retry_lost = lost()
+    try:
+        if len(retry_lost) < len(first_lost) and os.path.isfile(retry_out):
+            # The board and every artifact the retry wrote beside it (e.g. the
+            # KICAD_ROUTE_TRACE <stem>_routetrace.json), so nothing shipped
+            # still describes the discarded pass. retry_out has the output's
+            # basename, so names carry over unchanged.
+            stem = os.path.splitext(os.path.basename(retry_out))[0]
+            out_dir = os.path.dirname(os.path.abspath(args.output_file))
+            for name in os.listdir(tmp_dir):
+                if name.startswith(stem):
+                    shutil.copyfile(os.path.join(tmp_dir, name), os.path.join(out_dir, name))
+            print(f"No-net-loss retry: kept (lost {len(retry_lost)} net(s) instead "
+                  f"of {len(first_lost)}).")
+            return retry_result
+        print(f"No-net-loss retry: not better (lost {len(retry_lost)}); keeping "
+              f"the first pass.")
+        (LAST_RIPPED_STILL_OPEN, LAST_RIPPED_RECONNECT, LAST_RIPPED_CUSTODY,
+         LAST_REGRESSED_SIGNAL_NETS, LAST_NET_CLEARANCES_BY_NAME) = first_state
+        set_ledger(first_ledger)
+        return first_result
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # Naming (#562): this module's engine used to be called route_planes,
