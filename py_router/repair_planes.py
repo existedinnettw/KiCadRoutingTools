@@ -3718,7 +3718,7 @@ Examples:
     # --overwrite writes over the input: keep the original board (and its
     # project) for the no-net-loss retry, which must start from the same copper.
     _retry_src, _snap_dir = args.input_file, None
-    if not args.dry_run and os.path.abspath(args.input_file) == os.path.abspath(args.output_file):
+    if not args.dry_run and _same_file(args.input_file, args.output_file):
         import tempfile
         from copy_board import copy_board
         _snap_dir = tempfile.mkdtemp(prefix='repair_planes_input_')
@@ -3897,10 +3897,7 @@ Examples:
     # A10: nets this step ripped and could neither reconnect nor restore. They
     # ship OPEN, so they belong in the summary by name and in the exit code.
     _summary["ripped_still_open"] = list(LAST_RIPPED_STILL_OPEN)
-    _summary["disconnected_signal_nets"] = list(LAST_REGRESSED_SIGNAL_NETS)
-    if LAST_REGRESSED_SIGNAL_NETS:
-        _summary["complete"] = False
-        _summary["status"] = "regressed"
+    _mark_losses(_summary)
     # `complete`/`status` are kept because consumers read them -- see
     # route_summary's sticky-incompleteness merge. The CLI has no cancel
     # source, so the run either finished or raised.
@@ -3930,6 +3927,29 @@ Examples:
               "read this run as clean.")
         return 4
     return 0
+
+
+def _mark_losses(summary):
+    """Name the lost nets in the summary. Either loss list means the written
+    board is missing nets (and main() exits 4): never call it complete."""
+    summary["disconnected_signal_nets"] = list(LAST_REGRESSED_SIGNAL_NETS)
+    if LAST_REGRESSED_SIGNAL_NETS or LAST_RIPPED_STILL_OPEN:
+        summary["complete"] = False
+        summary["status"] = "regressed"
+    return summary
+
+
+def _same_file(a, b):
+    """True when two paths name the same file: same inode when both exist
+    (symlinks, hard links, case-only spellings on case-insensitive file
+    systems), else the same resolved, case-normalised path."""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.abspath(p)))
+    return norm(a) == norm(b)
 
 
 def _no_net_loss_retry(args, kwargs, first_result, retry_input=None, ledger_before=None):
