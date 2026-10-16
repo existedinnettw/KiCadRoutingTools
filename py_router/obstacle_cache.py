@@ -1304,8 +1304,9 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
     (tracks, vias, pads) priced at the rule value. [] when no rule binds.
 
     Raise-only and pair-exact, the same value `GridRouteConfig.pair_clearance`
-    returns for the pair. Net 0 is left out (its copper is footprint
-    mechanics -- NPTH holes -- the base map stamps it)."""
+    returns for the pair. Net 0's copper pads count as the Default class, as
+    in KiCad (a 'Logic*' vs non-'Logic*' rule binds against them); its NPTH
+    holes carry no copper and stay with the base map."""
     rules = getattr(config, 'class_rules', None)
     if not rules or not net_id:
         return []
@@ -1314,8 +1315,10 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
     mem = config.class_memberships or {}
     own = mem.get(net_id, ())
     need: Dict[int, float] = {}
-    for nid in pcb_data.nets:
-        if not nid or nid == net_id:
+    net0_copper = [p for p in pcb_data.pads_by_net.get(0, [])
+                   if getattr(p, 'pad_type', '') != 'np_thru_hole']
+    for nid in set(pcb_data.nets) | ({0} if net0_copper else set()):
+        if nid == net_id:
             continue
         v = track_pair_clearance(rules, own, mem.get(nid, ()), 0.0,
                                  track=False)[0]
@@ -1347,7 +1350,13 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
                 cfg = _dc_replace(config, net_clearance_floor=max(floor, v),
                                   class_rules=[])
                 cache['cfg'][v] = cfg
-            hit = (s, precompute_net_obstacles(pcb_data, nid, cfg))
+            src = pcb_data
+            if nid == 0:
+                # unconnected copper: net-0 pads with copper (not NPTH holes)
+                from dataclasses import replace as _dc_replace0
+                src = _dc_replace0(pcb_data, segments=[], vias=[],
+                                   pads_by_net={0: net0_copper})
+            hit = (s, precompute_net_obstacles(src, nid, cfg))
             cache['data'][key] = hit
         out.append(hit[1])
     # Copper a phase-3 rip-up has stamped into the working map but not yet

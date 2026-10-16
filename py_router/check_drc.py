@@ -225,17 +225,22 @@ class SpatialIndex:
                     layer_cells[(cx, cy)].append((pad, net_id))
 
     def get_nearby_segments(self, seg: Segment) -> List[Tuple[Segment, int]]:
-        """Get segments that might be near the given segment (same layer, nearby cells)."""
+        """Get segments that might be near the given segment (same layer, the
+        cells it passes through plus a one-cell margin). Without the margin
+        two parallel tracks either side of a cell boundary (y=1.9 / y=2.1 at
+        2 mm cells) were never compared, whatever their clearance."""
         cells = self._get_segment_cells(seg)
         layer_cells = self.cells_by_layer[seg.layer]
 
         seen = set()
         result = []
-        for cell in cells:
-            for obj, net_id in layer_cells.get(cell, []):
-                if isinstance(obj, Segment) and id(obj) not in seen:
-                    seen.add(id(obj))
-                    result.append((obj, net_id))
+        for (cx, cy) in cells:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for obj, net_id in layer_cells.get((cx + dx, cy + dy), []):
+                        if isinstance(obj, Segment) and id(obj) not in seen:
+                            seen.add(id(obj))
+                            result.append((obj, net_id))
         return result
 
     def get_nearby_for_via(self, via: Via, layer: str) -> List[Tuple[Any, int]]:
@@ -3308,7 +3313,14 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
     # Build spatial index for fast proximity queries
     if not quiet:
         print("Building spatial index...")
-    spatial_idx = SpatialIndex(cell_size=2.0)  # 2mm cells
+    # Every query looks one cell around its object, so a cell must span the
+    # farthest any pair can still violate: the largest clearance in force
+    # (net classes, .kicad_dru rules) plus the widest copper on either side.
+    _reach_cl = max([clearance] + list((_ncl_by_id or {}).values())
+                    + [r.clearance_mm for r in (_track_rules or [])])
+    _reach_cu = max([s.width for s in pcb_data.segments]
+                    + [v.size for v in pcb_data.vias] + [0.0])
+    spatial_idx = SpatialIndex(cell_size=max(2.0, _reach_cl + _reach_cu))
 
     # Add all segments to spatial index
     for seg in pcb_data.segments:
