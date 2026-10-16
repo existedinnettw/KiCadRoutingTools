@@ -125,6 +125,18 @@ class DiffPairNet:
         return self.p_net_id is not None and self.n_net_id is not None
 
 
+class RuleClearance(float):
+    """A clearance that a copper-scope .kicad_dru class rule holds at least at
+    ``rule_min``. `GridRouteConfig.layer_clearance` replaces a value by the
+    layer rule, as KiCad does a net-class value, but keeps ``rule_min``:
+    check_drc applies the layer replacement first and the class rule after."""
+
+    def __new__(cls, value: float, rule_min: Optional[float] = None):
+        obj = float.__new__(cls, value)
+        obj.rule_min = float(value if rule_min is None else rule_min)
+        return obj
+
+
 @dataclass
 class GridRouteConfig:
     """Configuration for grid-based routing."""
@@ -419,6 +431,9 @@ class GridRouteConfig:
     # The one net a freshly built per-net map serves (see `routing_net`);
     # None = a shared map, where the class rules go through the overlay.
     class_rule_net: Optional[int] = None
+    # The class-rule value every obstacle of this config is priced at least
+    # at (the copper-rule overlay's per-value config); None = no such floor.
+    class_rule_floor: Optional[float] = None
     # #530: the board's design rules resolved in KiCad's order
     # (design_rules.DesignRules), installed engine-side by
     # kicad_dru.install_layer_clearances for both fronts. None until then.
@@ -528,7 +543,9 @@ class GridRouteConfig:
         if self.layer_clearances:
             v = self.layer_clearances.get(layer)
             if v is not None:
-                return v
+                # check_drc's order: the layer rule replaces the class value,
+                # then a copper-scope class rule raises it again.
+                return max(v, getattr(fallback, 'rule_min', 0.0))
         return fallback
 
     def stack_clearance(self, fallback: float) -> float:
@@ -555,8 +572,13 @@ class GridRouteConfig:
         symmetry, issue #208/#309)."""
         floor = self.net_clearance_floor if self.net_clearance_floor is not None else self.clearance
         v = max(floor, self.net_clearances.get(net_id, self.clearance))
+        rule = self.class_rule_floor or 0.0
         if self.class_rule_net is not None and self.class_rules:
-            v = self.class_rule_clearance(self.class_rule_net, net_id, v)
+            rule = max(rule, self.class_rule_clearance(self.class_rule_net, net_id, 0.0))
+        if rule > v:
+            return RuleClearance(rule)
+        if rule:
+            return RuleClearance(v, rule)
         return v
 
     @contextmanager
