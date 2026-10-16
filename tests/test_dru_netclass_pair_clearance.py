@@ -354,6 +354,25 @@ def test_layer_rule_does_not_undo_the_class_rule():
     print("  PASS: the class rule survives the layer replacement")
 
 
+def test_overlay_compares_against_the_layer_replaced_stamp():
+    """A 1.0 mm routing floor above the 0.75 mm class rule is still replaced
+    by a 0.2 mm layer rule in the shared map's stamp, so the overlay must
+    re-stamp the field nets at 0.75."""
+    from obstacle_cache import GridObstacleMap, copper_rule_overlay
+    if GridObstacleMap is None:
+        print("  SKIP: grid_router not built")
+        return
+    pcb = _overlay_board()
+    cfg = _cfg()
+    cfg.class_memberships = {1: LOGIC}
+    cfg.net_clearance_floor = 1.0
+    assert copper_rule_overlay(pcb, 1, cfg) == []        # no layer rule: 1.0 covers it
+    cfg.layer_clearances = {'F.Cu': 0.2, 'B.Cu': 0.2}
+    pcb._copper_rule_overlay_cache = None
+    assert len(copper_rule_overlay(pcb, 1, cfg)) == 2
+    print("  PASS: the overlay sees through the layer replacement")
+
+
 def test_distance_windows_reach_the_largest_rule():
     from single_ended_routing import _foreign_window, _FOREIGN_PAD_WINDOW
     pcb = _overlay_board()
