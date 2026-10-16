@@ -2674,6 +2674,52 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                                  _gp_layer_map, verbose=verbose,
                                  net_clearances=net_clearances)
               if final_reconcile else None)
+    if (env_knobs.GLOBAL_PLAN.get('neg_commit') and _gplan is not None
+            and getattr(_gplan, 'negotiated_results', None) is not None):
+        # Negotiated-plan commit (experiment): the conflict-free nets' legal
+        # probe copper is this run's routing. Write it as the output and
+        # return without detailed routing, so the caller's usual output
+        # finalization (project DRC settings) still runs; a later route step
+        # finishes the board around it.
+        _keep = [r for nid, r in _gplan.negotiated_results.items()
+                 if nid not in _gplan.negotiated_conflicted
+                 and nid in _gplan.negotiated_legal]
+        # everything not committed is left: conflicted, not legal, or whose
+        # rough probe failed before negotiation (absent from the results)
+        _kept_ids = {nid for nid, r in _gplan.negotiated_results.items()
+                     if nid not in _gplan.negotiated_conflicted
+                     and nid in _gplan.negotiated_legal}
+
+        def _complete(nid):
+            """A committed net is done only when every terminal is joined: a
+            multipoint net's pad-pair probe or a tree with open taps still
+            needs the later router."""
+            r = _gplan.negotiated_results[nid]
+            if r.get('failed_pads_info'):
+                return False
+            if r.get('is_multipoint'):
+                return r.get('tap_pads_connected') == r.get('tap_pads_total')
+            from connectivity import get_multipoint_net_pads
+            return not get_multipoint_net_pads(pcb_data, nid, config)
+        _done = {nid for nid in _kept_ids if _complete(nid)}
+        _left = sorted(name for name, nid in single_ended_nets if nid not in _done)
+        print(f"Negotiated plan commit: writing {len(_keep)} conflict-free net(s) "
+              f"with legal probes ({len(_done)} complete), leaving {len(_left)} "
+              f"to the router: {', '.join(_left)}")
+        if not _gplan.negotiated_legal:
+            print("Negotiated plan commit: no legal probes (KICAD_GLOBAL_PLAN_NEG_LEGAL "
+                  "is off), so nothing is safe to ship; writing the input unchanged")
+        # committed nets count as routed, the ones left to a later step as failed
+        if return_results:
+            # in-memory callers (GUI, --preview) get the geometry, no file
+            _rd = _empty_results_data()
+            _rd['results'] = _keep
+            return len(_done), len(_left), 0.0, _rd
+        if _keep:
+            write_routed_output(input_file, output_file, _keep, [], [], [], [], [], pcb_data)
+        else:
+            _write_passthrough_output(input_file, output_file)
+        return len(_done), len(_left), 0.0
     if _gplan is not None:
         config._global_plan = _gplan
         _gp_nets_in = list(single_ended_nets)
