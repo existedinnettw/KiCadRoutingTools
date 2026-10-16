@@ -337,6 +337,50 @@ def test_check_drc_grades_the_rule_on_every_pair():
           "field-field at 0.4 mm passes")
 
 
+def test_overlay_includes_unconnected_copper_pads():
+    """Net-0 copper pads are Default class in KiCad, so a Logic-vs-non-Logic
+    rule binds against them; NPTH holes carry no copper and stay out."""
+    from obstacle_cache import GridObstacleMap, copper_rule_overlay
+    if GridObstacleMap is None:
+        print("  SKIP: grid_router not built")
+        return
+    from synth import make_pad
+    pcb = _overlay_board()
+    cfg = _cfg()
+    cfg.class_memberships = {1: LOGIC}
+    before = len(copper_rule_overlay(pcb, 1, cfg))
+    pcb.pads_by_net[0] = [make_pad(0, 30, 30, ref='H1'),
+                          make_pad(0, 40, 30, ref='H2', drill=1.0,
+                                   pad_type='np_thru_hole', layers=('F.Cu', 'B.Cu'))]
+    pcb._copper_rule_overlay_cache = None
+    over = copper_rule_overlay(pcb, 1, cfg)
+    assert len(over) == before + 1, (before, len(over))
+    print("  PASS: net-0 copper pads join the Logic overlay")
+
+
+_PCB_EDGE = _PCB.replace('(start 10 10) (end 20 10) (width 0.2) (layer "F.Cu") (net 1) (uuid "s1")',
+                         '(start 10 3.7) (end 20 3.7) (width 0.2) (layer "F.Cu") (net 1) (uuid "s1")') \
+                .replace('(start 10 10.6) (end 20 10.6) (width 0.2) (layer "F.Cu") (net 2) (uuid "s2")',
+                         '(start 10 4.3) (end 20 4.3) (width 0.2) (layer "F.Cu") (net 2) (uuid "s2")')
+
+
+def test_check_drc_sees_pairs_across_a_cell_boundary():
+    """Parallel tracks either side of a 2 mm index cell boundary (y=3.7 and
+    y=4.3, legal at 0.2 mm, not at the 0.75 mm rule) must still be compared."""
+    from check_drc import run_drc
+    with tempfile.TemporaryDirectory() as d:
+        pcb = os.path.join(d, 'b.kicad_pcb')
+        open(pcb, 'w').write(_PCB_EDGE)
+        open(os.path.join(d, 'b.kicad_pro'), 'w').write(json.dumps(_PRO))
+        open(os.path.join(d, 'b.kicad_dru'), 'w').write(_rule(ZECTIO))
+        v = run_drc(pcb, clearance=0.2, quiet=True, print_summary=False,
+                    check_sizes=False, clearance_margin=0.0)
+        segseg = [x for x in v if x['type'] == 'segment-segment'
+                  and {x.get('net1'), x.get('net2')} == {'LOGIC_A', 'FIELD_B'}]
+        assert segseg, [(x['type'], x.get('net1'), x.get('net2')) for x in v]
+    print("  PASS: the cross-boundary pair is graded against the rule")
+
+
 if __name__ == '__main__':
     for k, v in sorted(globals().items()):
         if k.startswith('test_'):
