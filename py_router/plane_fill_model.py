@@ -385,12 +385,14 @@ class ZoneFillModel:
                     # its hole_clearance rule) honors it, so stamp this pad at
                     # max(zc, class pair, override). The closure guard is
                     # rebound for the stamps below and restored after the loop.
-                    guard = _rule(p.net_id, max(
-                        guard_base, _nc.get(p.net_id, 0.0),
-                        getattr(p, 'local_clearance', 0.0) or 0.0))
+                    guard = max(guard_base, _nc.get(p.net_id, 0.0),
+                                getattr(p, 'local_clearance', 0.0) or 0.0)
                 if p.pad_type == 'np_thru_hole':
+                    # no copper: copper-scope class rules do not reach it
                     _stamp_disc(p.global_x, p.global_y, (p.drill or 0) / 2.0)
                     continue
+                if p.net_id != net_id:
+                    guard = _rule(p.net_id, guard)
                 if is_th and not on_layer:
                     _stamp_disc(p.global_x, p.global_y, (p.drill or 0) / 2.0)
                     continue
