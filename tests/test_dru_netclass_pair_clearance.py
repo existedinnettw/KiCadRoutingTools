@@ -271,6 +271,22 @@ def test_pair_overlay_covers_both_halves_and_balances():
     assert seen == [False], seen
     assert not obstacles.is_blocked(gx, gy, 0)
     assert obstacles.get_stats() == GridObstacleMap(2).get_stats()
+    # The centreline is inflated by the pair offset (0.2 + 0.2 gap) / 2 =
+    # 0.2 mm: a centreline 1.1 mm off FIELD_B's centre is legal for a single
+    # 0.2 mm track at 0.75 (gap 0.9), not for the pair's outer track, 0.9 mm
+    # off (gap 0.7).
+    cfg.diff_pair_gap = 0.2
+    fx, fy = int(round(15 / 0.05)), int(round((10 + 1.1) / 0.05))
+    seen.clear()
+
+    @with_copper_rule_overlay_pair
+    def search3(pcb_data, pair, config, obs):
+        seen.append(obs.is_blocked(fx, fy, 0))
+        return pair
+
+    search3(pcb, DiffPairNet(base_name='D', p_net_id=1, n_net_id=5), cfg, obstacles)
+    assert seen == [True], seen
+    assert not obstacles.is_blocked(fx, fy, 0)
     print("  PASS: a pair with one Logic half sees field copper at 0.75; map restored")
 
 
