@@ -499,11 +499,13 @@ def board_track_rules(pcb_data, board_path: str = None):
     the caller's ``board_path`` when it has one, else ``PCBData.source_path``.
 
     ``([], {})`` for no path, no sibling .kicad_dru, no rule, and for a
-    membership resolution that comes back EMPTY -- a rule whose class has no
-    members can never bind a pair, and returning it would leave a caller
-    paying for a live channel that is arithmetically dead. That last case
-    covers the ordinary "project declares no netclass_patterns" board, which
-    `net_class_memberships` answers with ``{}`` rather than an exception.
+    membership resolution that comes back EMPTY with no rule a Default pair
+    can bind -- a rule whose class has no members can never bind a pair, and
+    returning it would leave a caller paying for a live channel that is
+    arithmetically dead. That last case covers the ordinary "project declares
+    no netclass_patterns" board, which `net_class_memberships` answers with
+    ``{}`` rather than an exception; there every net is Default, so the rules
+    a Default pair binds are kept, with an empty membership map.
 
     It does not raise for any input `net_class_memberships` can produce; the
     two expressions outside the guards are the ``source_path`` read and the
@@ -533,7 +535,10 @@ def board_track_rules(pcb_data, board_path: str = None):
         # check_drc, which clears its own rule list on the same failure.
         return [], {}
     if not raw:
-        return [], {}
+        # Every net is Default: keep only the rules a Default pair can bind
+        # (an ``A.NetClass == 'Default'`` rule still binds every pair).
+        live = [r for r in rules if rule_binds(r, (), ())]
+        return (live, {}) if live else ([], {})
     return rules, {nid: frozenset(cls) for nid, cls in raw.items()}
 
 
