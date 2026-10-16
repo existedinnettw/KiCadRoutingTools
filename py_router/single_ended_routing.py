@@ -63,6 +63,17 @@ def _unblock_debug() -> bool:
 # kernels skip the bulk of the board's pads. Generous (~10x the largest realistic
 # margin) so routing stays byte-for-byte identical.
 _FOREIGN_PAD_WINDOW = 5.0  # mm
+
+
+def _foreign_window(pcb_data, base_clearance=None) -> float:
+    """The foreign-object broad-phase radius: _FOREIGN_PAD_WINDOW, grown by
+    the largest copper-scope class-rule excess installed on the board (an
+    8 mm isolation rule must still see a pad 6 mm away)."""
+    ctx = getattr(pcb_data, '_class_rule_ctx', None) if pcb_data is not None else None
+    if not ctx or not ctx[0]:
+        return _FOREIGN_PAD_WINDOW
+    top = max(r.clearance_mm for r in ctx[0])
+    return _FOREIGN_PAD_WINDOW + max(0.0, top - (base_clearance or 0.0))
 _LAYER_OF = attrgetter('layer')
 # The sample-by-foreign sweeps below (_seg_foreign_pad_dist,
 # _seg_foreign_seg_dist) run in ROW CHUNKS so that no matrix exceeds this
@@ -184,16 +195,17 @@ def _foreign_pad_arrays(pcb_data, layer):
 
 
 def _custom_pad_min_dist(custom, net_id, pts, base_clearance=None,
-                         net_clearances=None):
+                         net_clearances=None, pcb_data=None):
     """Exact min edge distance from sample points to the CUSTOM pads of other
     nets (check_drc.point_to_pad_distance -- the model kicad-cli agrees with to
     ~0.1um). Windowed by each pad's bbox + _FOREIGN_PAD_WINDOW; same
     base_clearance local-override and #436 net-class excess adjustments as
-    the vectorized kernels."""
+    the vectorized kernels, and (given ``pcb_data``) the copper-scope
+    class-rule excess."""
     if not custom:
         return 1e9
     from check_drc import point_to_pad_distance
-    R = _FOREIGN_PAD_WINDOW
+    R = _foreign_window(pcb_data, base_clearance)
     best = 1e9
     for nid, pad in custom:
         if nid == net_id:
@@ -206,6 +218,10 @@ def _custom_pad_min_dist(custom, net_id, pts, base_clearance=None,
             if net_clearances:
                 adj = max(adj, net_clearances.get(nid, base_clearance)
                           - base_clearance)
+            rx = _class_rule_excess(pcb_data, net_id, (nid,), base_clearance) \
+                if pcb_data is not None else None
+            if rx is not None:
+                adj = max(adj, float(rx[0]))
         # Branch-and-bound prune (exact-result-preserving): the polygons are
         # stored in GLOBAL coordinates, so the distance from a sample point to
         # the polygon's bounding BOX is a valid lower bound on its edge
@@ -296,10 +312,10 @@ def _pt_foreign_pad_dist(pcb_data, net_id, x, y, layer, base_clearance=None,
     nids, cx, cy, hx, hy, cr, rc, rs, ex, ey, plc, custom = \
         _foreign_pad_arrays(pcb_data, layer)
     best_custom = _custom_pad_min_dist(custom, net_id, ((x, y),), base_clearance,
-                                       net_clearances)
+                                       net_clearances, pcb_data)
     if cx.size == 0:
         return best_custom
-    R = _FOREIGN_PAD_WINDOW
+    R = _foreign_window(pcb_data, base_clearance)
     # Expand the window by each pad's own half-extent (global axes, so tilted
     # pads window by their true bbox): a large pad's EDGE can be within R even
     # when its centre is past R. Then min edge distance is exact for anything
@@ -348,10 +364,10 @@ def _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     sx = x1 + (x2 - x1) * _t
     sy = y1 + (y2 - y1) * _t
     best_custom = _custom_pad_min_dist(
-        custom, net_id, list(zip(sx, sy)), base_clearance, net_clearances)
+        custom, net_id, list(zip(sx, sy)), base_clearance, net_clearances, pcb_data)
     if cx.size == 0:
         return best_custom
-    R = _FOREIGN_PAD_WINDOW
+    R = _foreign_window(pcb_data, base_clearance)
     # Pad bbox (centre +/- global half-extent, true bbox for tilted pads) must
     # reach within R of the segment bbox; a pad excluded here is > R from every
     # sample point on the segment.
@@ -571,7 +587,7 @@ def _seg_foreign_seg_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     if nid.size == 0:
         return 1e9
     n = max(2, int(math.hypot(x2 - x1, y2 - y1) / 0.02) + 1)
-    R = _FOREIGN_PAD_WINDOW
+    R = _foreign_window(pcb_data, base_clearance)
     # The arrays were validated just above; the helpers would each pay the
     # cache signature again (two thirds of a query's time, 2026-10-08).
     fminx, fmaxx, fminy, fmaxy = _foreign_seg_bboxes(pcb_data, layer, validated=True)
@@ -678,7 +694,7 @@ def _seg_foreign_via_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     nids, cx, cy, rad = _foreign_via_arrays(pcb_data)
     if cx.size == 0:
         return 1e9
-    R = _FOREIGN_PAD_WINDOW
+    R = _foreign_window(pcb_data, base_clearance)
     mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     near = ((np.abs(cx - mx) <= R + abs(x2 - x1) / 2.0 + rad) &
             (np.abs(cy - my) <= R + abs(y2 - y1) / 2.0 + rad) & (nids != net_id))

@@ -775,8 +775,12 @@ def _small_via_pair(config, pcb_data):
 def precompute_net_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
                               extra_clearance: float = 0.0,
                               diagonal_margin: float = defaults.DIAGONAL_MARGIN,
-                              _small_pass: bool = False) -> NetObstacleData:
+                              _small_pass: bool = False,
+                              net0_graphics: bool = False) -> NetObstacleData:
     """Pre-compute obstacle cells for a single net.
+
+    ``net0_graphics``: for net 0, also stamp filled graphic interiors (the
+    class-rule overlay prices net-0 copper; the base map stamps it otherwise).
 
     Returns cached data that can be quickly added to obstacle maps via batch operations.
 
@@ -891,9 +895,9 @@ def precompute_net_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
                                    blocked_cell_spans_set, blocked_via_spans_set,
                                    via_block_mm)
     # #1181: a net-tagged FILLED graphic of this net is copper inside too; the
-    # loop above stamped only its perimeter (net-0 footprint copper never gets
-    # here -- the base map stamps it).
-    if net_id:
+    # loop above stamped only its perimeter (net-0 footprint copper gets here
+    # only from the class-rule overlay; the base map stamps it otherwise).
+    if net_id or net0_graphics:
         from check_drc import filled_graphic_shapes
         from obstacle_map import (filled_graphic_interior_cells,
                                   filled_graphic_interior_spans)
@@ -1399,9 +1403,10 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
     (tracks, vias, pads) priced at the rule value. [] when no rule binds.
 
     Raise-only and pair-exact, the same value `GridRouteConfig.pair_clearance`
-    returns for the pair. Net 0's copper pads count as the Default class, as
-    in KiCad (a 'Logic*' vs non-'Logic*' rule binds against them); its NPTH
-    holes carry no copper and stay with the base map."""
+    returns for the pair. Net 0's copper (pads, graphic outlines, filled
+    graphics) counts as the Default class, as in KiCad (a 'Logic*' vs
+    non-'Logic*' rule binds against it); NPTH holes carry no copper and stay
+    with the base map."""
     rules = getattr(config, 'class_rules', None)
     if not rules or not net_id:
         return []
@@ -1412,7 +1417,11 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
     need: Dict[int, float] = {}
     net0_copper = [p for p in pcb_data.pads_by_net.get(0, [])
                    if getattr(p, 'pad_type', '') != 'np_thru_hole']
-    for nid in set(pcb_data.nets) | ({0} if net0_copper else set()):
+    has_net0 = bool(net0_copper) or any(g.net_id == 0 for g in pcb_data.segments)
+    if not has_net0:
+        from check_drc import filled_graphic_shapes
+        has_net0 = any(sh.net_id == 0 for sh in filled_graphic_shapes(pcb_data))
+    for nid in set(pcb_data.nets) | ({0} if has_net0 else set()):
         if nid == net_id:
             continue
         v = track_pair_clearance(rules, own, mem.get(nid, ()), 0.0,
@@ -1437,21 +1446,20 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
         if hit is None or hit[0] != s:
             cfg = cache['cfg'].get(v)
             if cfg is None:
-                # obstacle_clearance(nid) = max(floor, class) -> raising the
-                # floor to v prices nid's copper at max(v, its own value).
-                floor = (config.net_clearance_floor
-                         if config.net_clearance_floor is not None
-                         else config.clearance)
-                cfg = _dc_replace(config, net_clearance_floor=max(floor, v),
-                                  class_rules=[])
+                # class_rule_floor prices nid's copper at max(v, its own
+                # value), and keeps v through a layer rule's replacement.
+                cfg = _dc_replace(config, class_rule_floor=v, class_rules=[])
                 cache['cfg'][v] = cfg
             src = pcb_data
             if nid == 0:
                 # unconnected copper: net-0 pads with copper (not NPTH holes)
                 from dataclasses import replace as _dc_replace0
-                src = _dc_replace0(pcb_data, segments=[], vias=[],
+                # net-0 copper: pads (not NPTH holes), graphic copper outlines
+                # (segments) and filled graphic interiors
+                src = _dc_replace0(pcb_data, vias=[],
+                                   segments=[g for g in pcb_data.segments if g.net_id == 0],
                                    pads_by_net={0: net0_copper})
-            hit = (s, precompute_net_obstacles(src, nid, cfg))
+            hit = (s, precompute_net_obstacles(src, nid, cfg, net0_graphics=(nid == 0)))
             cache['data'][key] = hit
         out.append(hit[1])
     # Copper a phase-3 rip-up has stamped into the working map but not yet
