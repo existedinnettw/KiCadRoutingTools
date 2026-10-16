@@ -573,6 +573,32 @@ def refresh() -> None:
         # lesson, predicted by the issue). 1.0 = off, 0 = no reservations
         # inside collars.
         'zone_scale': _f('KICAD_GLOBAL_PLAN_ZONE_SCALE', 1.0),
+        # Negotiated-congestion re-probing (PathFinder v2, negotiated_plan.py):
+        # rounds of re-probing every net against all other nets' current
+        # rough paths + a conflict history until no rough paths overlap.
+        # 0 = off. Costs are Rust units (one orthogonal grid step = 1000).
+        'negotiate': _i('KICAD_GLOBAL_PLAN_NEGOTIATE', 0),
+        'neg_pres': _f('KICAD_GLOBAL_PLAN_NEG_PRES', 500.0),
+        'neg_growth': _f('KICAD_GLOBAL_PLAN_NEG_GROWTH', 1.5),
+        'neg_pres_max': _f('KICAD_GLOBAL_PLAN_NEG_PRES_MAX', 0.0),  # 0 = uncapped
+        'neg_hist': _f('KICAD_GLOBAL_PLAN_NEG_HIST', 300.0),
+        'neg_hweight': _f('KICAD_GLOBAL_PLAN_NEG_HWEIGHT', 1.2),
+        'neg_iters': _i('KICAD_GLOBAL_PLAN_NEG_ITERS', 50000),
+        'neg_dump': _s('KICAD_GLOBAL_PLAN_NEG_DUMP', ''),  # JSON: kept paths + conflict cells
+        # Experiment: the kept plan's conflict-free, legal nets' probe copper
+        # is the run's output, and detailed routing is skipped (a later route
+        # step keeps it as existing copper).
+        'neg_commit': _opt_in('KICAD_GLOBAL_PLAN_COMMIT'),
+        # Negotiation probes see other routed nets' pads/stubs (per-net maps,
+        # like detailed routing) instead of the plan's relaxed shared map.
+        'neg_legal': _opt_in('KICAD_GLOBAL_PLAN_NEG_LEGAL'),
+        # Negotiate whole trees: a 3+ terminal net is re-probed as main edge +
+        # taps, and its conflict zones come from all of its copper (needs
+        # neg_legal: taps route on the net's own map).
+        'neg_tree': _opt_in('KICAD_GLOBAL_PLAN_NEG_TREE'),
+        # Exact conflict distances: open disks at the true pairwise distance
+        # (no ceil slack), off-grid copper covered from every rounding.
+        'neg_exact': _opt_in('KICAD_GLOBAL_PLAN_NEG_EXACT'),
         # Clique-aware layer levers (#589 options 1+2): 'layer'=pref arms the
         # SOFT per-net step-cost discount on the plan-assigned layer;
         # 'swaps'=1 MOVES stub copper onto the assigned layer up front via
