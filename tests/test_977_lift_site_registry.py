@@ -67,6 +67,10 @@ REGISTRY = {
         LIFTS, 'the rescue reaches neither prepare nor build_single_ended_'
                'obstacles, so the clone it hands out arrives lifted (#977; '
                'the base build used to do this for it)'),
+    ('py_router/negotiated_plan.py', 'build'): (
+        LIFTS, "legal_map_builder's per-net map for a committed plan route: "
+               'clones the probe map for ONE net, adds the other nets, lifts '
+               'on the clone; discarded with the route'),
 
     # --- hands the map to a lifter ----------------------------------------
     ('py_router/route.py', 'batch_route'): (
