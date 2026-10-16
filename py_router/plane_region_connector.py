@@ -16,7 +16,7 @@ import numpy as np
 
 from kicad_parser import (PCBData, Via, Segment, Pad, POSITION_DECIMALS,
                           pad_drill_circles, pad_is_plated_through)
-from routing_config import GridRouteConfig, GridCoord
+from routing_config import GridRouteConfig, GridCoord, prices_one_net
 from routing_utils import (point_in_pad_rect, pad_rect_halfspan, filter_cells_in_pad_rect,
                            segment_blocked_cells_array)
 from geometry_utils import UnionFind
@@ -3170,6 +3170,7 @@ def route_disconnected_regions(
     return segments, vias, routes_added, previous_routes, connectivity_paths
 
 
+
 def via_bridge_width(leg, track_width, via_size, min_track_width,
                      pcb_data, net_id, config):
     """Width for a via-suppression bridge on one layer, or None to skip it.
@@ -3219,6 +3220,7 @@ def via_bridge_width(leg, track_width, via_size, min_track_width,
     return None
 
 
+@prices_one_net('net_id')
 def wide_route_clear(route_points, width, pcb_data, net_id, config,
                      board_edge_clearance=None):
     """True iff every same-layer leg of `route_points`, emitted at `width`,
@@ -3422,6 +3424,7 @@ def wide_route_clear(route_points, width, pcb_data, net_id, config,
     return True
 
 
+@prices_one_net('exclude_net_ids')
 def build_base_obstacles(
     exclude_net_ids: Set[int],
     routing_layers: List[str],

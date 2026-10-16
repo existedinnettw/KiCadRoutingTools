@@ -225,17 +225,22 @@ class SpatialIndex:
                     layer_cells[(cx, cy)].append((pad, net_id))
 
     def get_nearby_segments(self, seg: Segment) -> List[Tuple[Segment, int]]:
-        """Get segments that might be near the given segment (same layer, nearby cells)."""
+        """Get segments that might be near the given segment (same layer, the
+        cells it passes through plus a one-cell margin). Without the margin
+        two parallel tracks either side of a cell boundary (y=1.9 / y=2.1 at
+        2 mm cells) were never compared, whatever their clearance."""
         cells = self._get_segment_cells(seg)
         layer_cells = self.cells_by_layer[seg.layer]
 
         seen = set()
         result = []
-        for cell in cells:
-            for obj, net_id in layer_cells.get(cell, []):
-                if isinstance(obj, Segment) and id(obj) not in seen:
-                    seen.add(id(obj))
-                    result.append((obj, net_id))
+        for (cx, cy) in cells:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for obj, net_id in layer_cells.get((cx + dx, cy + dy), []):
+                        if isinstance(obj, Segment) and id(obj) not in seen:
+                            seen.add(id(obj))
+                            result.append((obj, net_id))
         return result
 
     def get_nearby_for_via(self, via: Via, layer: str) -> List[Tuple[Any, int]]:
@@ -3113,13 +3118,33 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
                            if n.name})
         except Exception:
             _track_rules = []
+    # Copper-scope class rules (no Type term) ride the same list: they bind
+    # EVERY copper pair, so `_pair_cl` raises with them (pair-exact, after the
+    # #498 layer replacement) and a violation of one grades like any physical
+    # clearance violation -- KiCad reports it as one.
+    _class_rules = [r for r in _track_rules if r.scope == 'copper']
     if not quiet and _track_rules:
         for _n in _track_notes:
             print(f"  .kicad_dru: {_n}")
-        print("Track-to-track clearance rules (.kicad_dru): "
-              + ", ".join(f"'{r.cls}':{r.clearance_mm:g}"
-                          f"{'(other-only)' if r.other_only else ''}"
-                          for r in _track_rules))
+        for _scope, _what in (('track', 'Track-to-track'),
+                              ('copper', 'Net-class (all copper)')):
+            _rs = [r for r in _track_rules if r.scope == _scope]
+            if _rs:
+                print(f"{_what} clearance rules (.kicad_dru): "
+                      + ", ".join(f"'{r.cls}':{r.clearance_mm:g}"
+                                  f"{'(other-only)' if r.other_only else ''}"
+                                  for r in _rs))
+
+    def _rule_pair_cl(rules, net_a: int, net_b: int, eff: float,
+                      track: bool):
+        # The ONE call into the shared binding predicate (#735).
+        return track_pair_clearance(rules, _cls_of.get(net_a, ()),
+                                    _cls_of.get(net_b, ()), eff, track=track)
+
+    def _class_cl(net_a: int, net_b: int, eff: float) -> float:
+        if not _class_rules:
+            return eff
+        return _rule_pair_cl(_class_rules, net_a, net_b, eff, False)[0]
 
     def _track_pair_cl(net_a: int, net_b: int, layer: str):
         """Effective seg-seg clearance for the pair, plus the TrackRule
@@ -3140,8 +3165,7 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
         eff = _pair_cl(net_a, net_b, layer=layer)
         if not _track_rules:
             return eff, None
-        return track_pair_clearance(_track_rules, _cls_of.get(net_a, ()),
-                                    _cls_of.get(net_b, ()), eff)
+        return _rule_pair_cl(_track_rules, net_a, net_b, eff, True)
 
     def _layer_cl(layer: str, eff: float) -> float:
         v = _lcl.get(layer) if _lcl else None
@@ -3171,8 +3195,8 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
         base = clearance if not _ncl_by_id else \
             max(clearance, _ncl_by_id.get(net_a, 0.0), _ncl_by_id.get(net_b, 0.0))
         if layer is not None:
-            return _layer_cl(layer, base)
-        return base
+            return _class_cl(net_a, net_b, _layer_cl(layer, base))
+        return _class_cl(net_a, net_b, base)
 
     # A pad / footprint clearance OVERRIDE replaces the class/rule value,
     # floored at rules.min_clearance (KiCad 10, measured by
@@ -3188,6 +3212,7 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
             eff = _layer_cl(layer, eff)
         else:
             eff = _pads_cl(eff, pad, other_pad)
+        eff = _class_cl(pad.net_id, other_net, eff)
         return _override_clr(eff, _board_min_clr, pad, other_pad)
 
     def _mark_required(v: dict, eff: float) -> dict:
@@ -3288,7 +3313,14 @@ def run_drc(pcb_file: str, clearance: float = 0.1, net_patterns: Optional[List[s
     # Build spatial index for fast proximity queries
     if not quiet:
         print("Building spatial index...")
-    spatial_idx = SpatialIndex(cell_size=2.0)  # 2mm cells
+    # Every query looks one cell around its object, so a cell must span the
+    # farthest any pair can still violate: the largest clearance in force
+    # (net classes, .kicad_dru rules) plus the widest copper on either side.
+    _reach_cl = max([clearance] + list((_ncl_by_id or {}).values())
+                    + [r.clearance_mm for r in (_track_rules or [])])
+    _reach_cu = max([s.width for s in pcb_data.segments]
+                    + [v.size for v in pcb_data.vias] + [0.0])
+    spatial_idx = SpatialIndex(cell_size=max(2.0, _reach_cl + _reach_cu))
 
     # Add all segments to spatial index
     for seg in pcb_data.segments:

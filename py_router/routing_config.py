@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from typing import List, Optional, Tuple, Dict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from routing_constants import FORBIDDEN_LAYER_COST
@@ -71,6 +72,40 @@ def _snap_to_lattice_reach(margin: float, e: float) -> float:
     return need * (1.0 + 1e-12)
 
 
+
+def prices_one_net(param: str):
+    """Decorator for a builder or gate that serves ONE routed net, named by
+    its argument ``param`` (an int, or a one-element set of net ids): the
+    call runs under ``config.routing_net(<that net>)`` so the .kicad_dru
+    copper-scope class rules price its foreign copper pair-exact. A no-op
+    without class rules or when the argument names no single net."""
+    import functools
+    import inspect
+
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            # Cheap gate first: a board without class rules pays no binding.
+            if not any(getattr(a, 'class_rules', None)
+                       for a in (*args, *kwargs.values())
+                       if isinstance(a, GridRouteConfig)):
+                return fn(*args, **kwargs)
+            b = sig.bind_partial(*args, **kwargs)
+            config = b.arguments.get('config')
+            if config is None or not getattr(config, 'class_rules', None):
+                return fn(*args, **kwargs)
+            nid = b.arguments.get(param)
+            if isinstance(nid, (set, frozenset, list, tuple)):
+                nid = next(iter(nid)) if len(nid) == 1 else None
+            if nid is None:
+                return fn(*args, **kwargs)
+            with config.routing_net(nid):
+                return fn(*args, **kwargs)
+        return wrapped
+    return deco
+
 @dataclass
 class DiffPairNet:
     """Represents a differential pair with P and N nets (tracks net IDs)."""
@@ -88,6 +123,18 @@ class DiffPairNet:
     @property
     def is_complete(self) -> bool:
         return self.p_net_id is not None and self.n_net_id is not None
+
+
+class RuleClearance(float):
+    """A clearance that a copper-scope .kicad_dru class rule holds at least at
+    ``rule_min``. `GridRouteConfig.layer_clearance` replaces a value by the
+    layer rule, as KiCad does a net-class value, but keeps ``rule_min``:
+    check_drc applies the layer replacement first and the class rule after."""
+
+    def __new__(cls, value: float, rule_min: Optional[float] = None):
+        obj = float.__new__(cls, value)
+        obj.rule_min = float(value if rule_min is None else rule_min)
+        return obj
 
 
 @dataclass
@@ -369,6 +416,24 @@ class GridRouteConfig:
     # consults it (KiCad's Type=='track' binds tracks only). An empty map is
     # a strict no-op. Like the layer map: no CLI flag, no GUI control.
     track_clearances: Dict[int, float] = field(default_factory=dict)
+    # Copper-scope net-class rules from the same .kicad_dru (a NetClass pair
+    # condition with no Type term, e.g. an isolation rule
+    # "A.NetClass == 'Logic*' && B.NetClass != 'Logic*'"): kicad_dru.TrackRule
+    # entries with scope 'copper', plus {net_id: frozenset of class names}.
+    # They bind EVERY copper pair (track, via, pad) and are priced PAIR-EXACT,
+    # raise-only: `pair_clearance` / `pad_pair_clearance` for verdicts, and a
+    # per-search overlay (obstacle_cache.copper_rule_overlay) for the A*
+    # map -- never folded into the shared per-obstacle stamps, which would
+    # price every net at the rule value whenever both sides route in one
+    # call. Installed by kicad_dru.install_track_clearances; empty = no-op.
+    class_rules: List = field(default_factory=list)
+    class_memberships: Dict[int, frozenset] = field(default_factory=dict)
+    # The one net a freshly built per-net map serves (see `routing_net`);
+    # None = a shared map, where the class rules go through the overlay.
+    class_rule_net: Optional[int] = None
+    # The class-rule value every obstacle of this config is priced at least
+    # at (the copper-rule overlay's per-value config); None = no such floor.
+    class_rule_floor: Optional[float] = None
     # #530: the board's design rules resolved in KiCad's order
     # (design_rules.DesignRules), installed engine-side by
     # kicad_dru.install_layer_clearances for both fronts. None until then.
@@ -455,6 +520,20 @@ class GridRouteConfig:
         v = self.track_clearances.get(net_id)
         return resolved if v is None or v <= resolved else v
 
+    def class_rule_clearance(self, net_a: int, net_b: int,
+                             resolved: float) -> float:
+        """Copper-scope .kicad_dru class rules for the pair (net_a, net_b):
+        max(resolved, every binding rule) -- raise-only, pair-exact, applied
+        AFTER the #498 layer replacement like the track channel. ``resolved``
+        unchanged when the board declares none."""
+        if not self.class_rules:
+            return resolved
+        from kicad_dru import track_pair_clearance
+        mem = self.class_memberships
+        return track_pair_clearance(self.class_rules, mem.get(net_a, ()),
+                                    mem.get(net_b, ()), resolved,
+                                    track=False)[0]
+
     def layer_clearance(self, layer: str, fallback: float) -> float:
         """#498 pair clearance on `layer`: the .kicad_dru rule value when the
         layer is ruled (replacement -- may be below `fallback`), else
@@ -464,7 +543,9 @@ class GridRouteConfig:
         if self.layer_clearances:
             v = self.layer_clearances.get(layer)
             if v is not None:
-                return v
+                # check_drc's order: the layer rule replaces the class value,
+                # then a copper-scope class rule raises it again.
+                return max(v, getattr(fallback, 'rule_min', 0.0))
         return fallback
 
     def stack_clearance(self, fallback: float) -> float:
@@ -490,7 +571,31 @@ class GridRouteConfig:
         and REMOVE paths derive an identical per-obstacle value (ref-count
         symmetry, issue #208/#309)."""
         floor = self.net_clearance_floor if self.net_clearance_floor is not None else self.clearance
-        return max(floor, self.net_clearances.get(net_id, self.clearance))
+        v = max(floor, self.net_clearances.get(net_id, self.clearance))
+        rule = self.class_rule_floor or 0.0
+        if self.class_rule_net is not None and self.class_rules:
+            rule = max(rule, self.class_rule_clearance(self.class_rule_net, net_id, 0.0))
+        if rule > v:
+            return RuleClearance(rule)
+        if rule:
+            return RuleClearance(v, rule)
+        return v
+
+    @contextmanager
+    def routing_net(self, net_id: Optional[int]):
+        """Within the block, `obstacle_clearance` prices every obstacle for a
+        map that serves ONE routed net -- ``net_id`` -- so the copper-scope
+        .kicad_dru class rules apply pair-exact there. For builders that make
+        a fresh per-net map (the plane repair's `build_base_obstacles`, its
+        `wide_route_clear` gate); never around a shared map's stamps, whose
+        add/remove symmetry needs one value per obstacle. Inert without class
+        rules; restores the previous value on exit."""
+        prev = self.class_rule_net
+        self.class_rule_net = net_id if self.class_rules else None
+        try:
+            yield self
+        finally:
+            self.class_rule_net = prev
 
     def set_net_clearances(self, net_clearances, routed_net_ids) -> None:
         """Install the cross-class clearance map and compute the routing-side
@@ -538,6 +643,10 @@ class GridRouteConfig:
         * 'stack' -- via vs via, which meet on every layer: the max over the
           stack (check_drc's `_stack_cl`). `layer` is ignored.
 
+        Every kind then takes the copper-scope .kicad_dru class rules
+        (`class_rule_clearance`): pair-exact and raise-only, as check_drc's
+        `_pair_cl` applies them.
+
         With no class map, no layer rule and no track rule it returns `base`
         unchanged, so a site that swaps its flat term for this call is
         byte-identical on such a board."""
@@ -551,7 +660,8 @@ class GridRouteConfig:
             if b is not None and b > clr:
                 clr = b
         if kind == 'stack':
-            return self.stack_clearance(clr)
+            return self.class_rule_clearance(net_a, net_b,
+                                             self.stack_clearance(clr))
         if kind != 'layer' and kind != 'track':
             raise ValueError(f"pair_clearance kind {kind!r}: expected "
                              f"'layer', 'track' or 'stack'")
@@ -564,7 +674,7 @@ class GridRouteConfig:
                     clr = widest
             clr = max(self.track_obstacle_clearance(net_a, clr),
                       self.track_obstacle_clearance(net_b, clr))
-        return clr
+        return self.class_rule_clearance(net_a, net_b, clr)
 
     def pad_pair_clearance(self, pad, other_net: int,
                            layer: Optional[str] = None, *, other_pad=None,
@@ -588,6 +698,9 @@ class GridRouteConfig:
                 mv = max(m.values())
                 if mv > v:
                     v = mv
+        for r in self.class_rules or ():
+            if r.clearance_mm > v:
+                v = r.clearance_mm
         return v
 
     def pair_clearance_inert(self) -> bool:
@@ -595,7 +708,7 @@ class GridRouteConfig:
         class map, no .kicad_dru layer rule, no track rule. A hot loop may
         then keep its flat term instead of pricing every item."""
         return not (self.net_clearances or self.layer_clearances
-                    or self.track_clearances)
+                    or self.track_clearances or self.class_rules)
 
     def pad_pair_clearance_before_override(self, pad, other_net: int,
                                            layer: Optional[str] = None, *,
@@ -610,10 +723,11 @@ class GridRouteConfig:
         class and rule term only, so a board that declares neither is
         unchanged whatever its pads carry). `pad_pair_clearance` is
         `pad_override_clearance(<this>, pad, other_pad)`."""
-        eff = self.pair_clearance(getattr(pad, 'net_id', 0) or 0, other_net,
-                                  base=base)
+        pad_net = getattr(pad, 'net_id', 0) or 0
+        eff = self.pair_clearance(pad_net, other_net, base=base)
         if layer is not None:
-            return self.layer_clearance(layer, eff)
+            return self.class_rule_clearance(
+                pad_net, other_net, self.layer_clearance(layer, eff))
         if self.layer_clearances:
             from check_drc import pads_shared_layer_clearance, pad_copper_layers
             cu = list(self.board_copper_layers or self.layers)
@@ -621,7 +735,7 @@ class GridRouteConfig:
                 eff, self.layer_clearances, pad_copper_layers(pad, cu),
                 pad_copper_layers(other_pad, cu) if other_pad is not None
                 else None)
-        return eff
+        return self.class_rule_clearance(pad_net, other_net, eff)
 
     def net_clearances_by_name(self, nets) -> Dict[str, float]:
         """The class map keyed by NET NAME, for a consumer that re-parses a
