@@ -1396,7 +1396,8 @@ def _copper_signature(pcb_data) -> Dict[int, Tuple[int, int]]:
     return {k: (a, b) for k, (a, b) in sig.items()}
 
 
-def copper_rule_overlay(pcb_data, net_id: int, config, exclude=()) -> List[NetObstacleData]:
+def copper_rule_overlay(pcb_data, net_id: int, config, exclude=(),
+                        extra_clearance: float = 0.0) -> List[NetObstacleData]:
     """The extra keep-outs a search for ``net_id`` needs under the board's
     copper-scope class rules (``config.class_rules``): for every other net X a
     rule binds against ``net_id`` above X's own stamp value, X's copper
@@ -1444,7 +1445,7 @@ def copper_rule_overlay(pcb_data, net_id: int, config, exclude=()) -> List[NetOb
     sig = _copper_signature(pcb_data)
     out: List[NetObstacleData] = []
     for nid, v in need.items():
-        key = (nid, v)
+        key = (nid, v, round(extra_clearance, 6))
         s = sig.get(nid, (0, 0))
         hit = cache['data'].get(key)
         if hit is None or hit[0] != s:
@@ -1463,7 +1464,8 @@ def copper_rule_overlay(pcb_data, net_id: int, config, exclude=()) -> List[NetOb
                 src = _dc_replace0(pcb_data, vias=[],
                                    segments=[g for g in pcb_data.segments if g.net_id == 0],
                                    pads_by_net={0: net0_copper})
-            hit = (s, precompute_net_obstacles(src, nid, cfg, net0_graphics=(nid == 0)))
+            hit = (s, precompute_net_obstacles(src, nid, cfg, extra_clearance=extra_clearance,
+                                               net0_graphics=(nid == 0)))
             cache['data'][key] = hit
         out.append(hit[1])
     # Copper a phase-3 rip-up has stamped into the working map but not yet
@@ -1477,7 +1479,8 @@ def copper_rule_overlay(pcb_data, net_id: int, config, exclude=()) -> List[NetOb
                 segments=[x for x in segs if x.net_id == nid],
                 vias=[x for x in vias if x.net_id == nid])
             out.append(precompute_net_obstacles(shadow, nid,
-                                                cache['cfg'][need[nid]]))
+                                                cache['cfg'][need[nid]],
+                                                extra_clearance=extra_clearance))
     return out
 
 
@@ -1530,9 +1533,13 @@ def with_copper_rule_overlay_pair(fn):
         keys = [(id(obstacles), n) for n in nets]
         if any(k in _OVERLAY_ACTIVE for k in keys):
             return fn(pcb_data, diff_pair, config, obstacles, *args, **kwargs)
+        # the search runs on the pair's centreline; each emitted track sits
+        # (track_width + gap) / 2 off it, as the diff router's own maps assume
+        off = (config.track_width + getattr(config, 'diff_pair_gap', 0.0)) / 2.0
         added = [d for n in nets
                  for d in copper_rule_overlay(pcb_data, n, config,
-                                              exclude=[m for m in nets if m != n])]
+                                              exclude=[m for m in nets if m != n],
+                                              extra_clearance=off)]
         for d in added:
             add_net_obstacles_from_cache(obstacles, d)
         _OVERLAY_ACTIVE.update(keys)
