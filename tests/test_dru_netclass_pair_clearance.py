@@ -236,6 +236,44 @@ def test_overlay_binds_the_other_side_and_balances():
     print("  PASS: Logic search sees field copper at 0.75; map restored")
 
 
+def test_pair_overlay_covers_both_halves_and_balances():
+    """A differential pair's search gets the class-rule overlay of its P and
+    its N net (route_diff_pair_with_obstacles), and the map is restored."""
+    from obstacle_cache import GridObstacleMap, with_copper_rule_overlay_pair
+    from routing_config import DiffPairNet
+    if GridObstacleMap is None:
+        print("  SKIP: grid_router not built")
+        return
+    pcb = _overlay_board()
+    cfg = _cfg()
+    cfg.class_memberships = {1: LOGIC}            # only the P half is Logic
+    obstacles = GridObstacleMap(2)
+    gx, gy = int(round(15 / 0.05)), int(round((10 + 0.6) / 0.05))
+    seen = []
+
+    @with_copper_rule_overlay_pair
+    def search(pcb_data, pair, config, obs):
+        seen.append(obs.is_blocked(gx, gy, 0))
+        return pair
+
+    pair = DiffPairNet(base_name='D', p_net_id=3, n_net_id=1)
+    assert search(pcb, pair, cfg, obstacles) is pair and seen == [True]
+    # the partner half (LOGIC_A's track at y=20) is not stamped for FIELD_C
+    hx, hy = int(round(15 / 0.05)), int(round((20 + 0.6) / 0.05))
+    seen.clear()
+
+    @with_copper_rule_overlay_pair
+    def search2(pcb_data, pair, config, obs):
+        seen.append(obs.is_blocked(hx, hy, 0))
+        return pair
+
+    search2(pcb, pair, cfg, obstacles)
+    assert seen == [False], seen
+    assert not obstacles.is_blocked(gx, gy, 0)
+    assert obstacles.get_stats() == GridObstacleMap(2).get_stats()
+    print("  PASS: a pair with one Logic half sees field copper at 0.75; map restored")
+
+
 def test_foreign_distance_gates_fold_the_rule():
     """The post-route gates (smoothing, necking, rescue) measure through the
     single_ended_routing foreign-distance helpers with `dist >= base + w/2`;
