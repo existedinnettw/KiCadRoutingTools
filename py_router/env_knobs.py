@@ -494,6 +494,10 @@ def refresh() -> None:
         'neg_hweight': _f('KICAD_GLOBAL_PLAN_NEG_HWEIGHT', 1.2),
         'neg_iters': _i('KICAD_GLOBAL_PLAN_NEG_ITERS', 50000),
         'neg_dump': _s('KICAD_GLOBAL_PLAN_NEG_DUMP', ''),  # JSON: kept paths + conflict cells
+        # Experiment: the kept plan's conflict-free, legal nets' probe copper
+        # is the run's output, and detailed routing is skipped (a later route
+        # step keeps it as existing copper).
+        'neg_commit': _opt_in('KICAD_GLOBAL_PLAN_COMMIT'),
         # Negotiation probes see other routed nets' pads/stubs (per-net maps,
         # like detailed routing) instead of the plan's relaxed shared map.
         'neg_legal': _opt_in('KICAD_GLOBAL_PLAN_NEG_LEGAL'),
