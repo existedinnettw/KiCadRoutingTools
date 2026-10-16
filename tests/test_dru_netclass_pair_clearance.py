@@ -337,6 +337,33 @@ def test_check_drc_grades_the_rule_on_every_pair():
           "field-field at 0.4 mm passes")
 
 
+def test_layer_rule_does_not_undo_the_class_rule():
+    """A layer clearance replaces the class value, as in KiCad, but the class
+    rule then raises it again (check_drc's order): both the per-net map
+    (routing_net) and the overlay's per-value config keep 0.75 on a layer
+    ruled at 0.2."""
+    from dataclasses import replace
+    cfg = _cfg()
+    cfg.layer_clearances = {'F.Cu': 0.2}
+    with cfg.routing_net(1):
+        assert cfg.layer_clearance('F.Cu', cfg.obstacle_clearance(2)) == 0.75
+        assert cfg.layer_clearance('F.Cu', cfg.obstacle_clearance(4)) == 0.2
+    over = replace(cfg, class_rule_floor=0.75, class_rules=[])
+    assert over.layer_clearance('F.Cu', over.obstacle_clearance(2)) == 0.75
+    assert cfg.layer_clearance('F.Cu', cfg.obstacle_clearance(2)) == 0.2
+    print("  PASS: the class rule survives the layer replacement")
+
+
+def test_distance_windows_reach_the_largest_rule():
+    from single_ended_routing import _foreign_window, _FOREIGN_PAD_WINDOW
+    pcb = _overlay_board()
+    assert _foreign_window(pcb, 0.2) == _FOREIGN_PAD_WINDOW
+    big = ISO._replace(clearance_mm=8.0)
+    pcb._class_rule_ctx = ([big], {1: LOGIC})
+    assert abs(_foreign_window(pcb, 0.2) - (_FOREIGN_PAD_WINDOW + 7.8)) < 1e-9
+    print("  PASS: an 8 mm rule widens the distance windows")
+
+
 def test_overlay_includes_unconnected_copper_pads():
     """Net-0 copper pads are Default class in KiCad, so a Logic-vs-non-Logic
     rule binds against them; NPTH holes carry no copper and stay out."""
