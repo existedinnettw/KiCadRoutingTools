@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Dict
 
 from kicad_parser import PCBData, Segment, Via
 from routing_config import GridRouteConfig, GridCoord, DiffPairNet, REFERENCE_GRID_STEP
+from obstacle_cache import with_copper_rule_overlay_pair
 from routing_utils import segment_length, build_layer_map, pos_key
 from connectivity import (
     find_connected_groups, find_stub_free_ends, get_stub_direction, get_net_endpoints,
@@ -4314,6 +4315,7 @@ def seam_reask_chain_leg(pcb_data, pair, config, leg_obstacles, layer_names,
     return True
 
 
+@with_copper_rule_overlay_pair
 def route_diff_pair_with_obstacles(pcb_data: PCBData, diff_pair: DiffPairNet,
                                     config: GridRouteConfig,
                                     obstacles: GridObstacleMap,
