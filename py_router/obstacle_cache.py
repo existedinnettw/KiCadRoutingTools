@@ -1396,7 +1396,7 @@ def _copper_signature(pcb_data) -> Dict[int, Tuple[int, int]]:
     return {k: (a, b) for k, (a, b) in sig.items()}
 
 
-def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
+def copper_rule_overlay(pcb_data, net_id: int, config, exclude=()) -> List[NetObstacleData]:
     """The extra keep-outs a search for ``net_id`` needs under the board's
     copper-scope class rules (``config.class_rules``): for every other net X a
     rule binds against ``net_id`` above X's own stamp value, X's copper
@@ -1422,7 +1422,7 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
         from check_drc import filled_graphic_shapes
         has_net0 = any(sh.net_id == 0 for sh in filled_graphic_shapes(pcb_data))
     for nid in set(pcb_data.nets) | ({0} if has_net0 else set()):
-        if nid == net_id:
+        if nid == net_id or nid in exclude:
             continue
         v = track_pair_clearance(rules, own, mem.get(nid, ()), 0.0,
                                  track=False)[0]
@@ -1507,6 +1507,39 @@ def with_copper_rule_overlay(fn):
             return fn(pcb_data, net_id, config, obstacles, *args, **kwargs)
         finally:
             _OVERLAY_ACTIVE.discard(key)
+            for d in reversed(added):
+                remove_net_obstacles_from_cache(obstacles, d)
+    return wrapped
+
+
+def with_copper_rule_overlay_pair(fn):
+    """`with_copper_rule_overlay` for a differential-pair search entry
+    ``fn(pcb_data, diff_pair, config, obstacles, ...)``: the class-rule
+    overlay of BOTH the P and the N net is stamped for the call (each net's
+    own rule requirements; the stamps are ref-counted, so a foreign net both
+    halves are bound against is simply stamped twice) and removed on exit.
+    Neither half is an obstacle to the other through a rule."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(pcb_data, diff_pair, config, obstacles, *args, **kwargs):
+        if not getattr(config, 'class_rules', None):
+            return fn(pcb_data, diff_pair, config, obstacles, *args, **kwargs)
+        nets = [n for n in (getattr(diff_pair, 'p_net_id', None),
+                            getattr(diff_pair, 'n_net_id', None)) if n]
+        keys = [(id(obstacles), n) for n in nets]
+        if any(k in _OVERLAY_ACTIVE for k in keys):
+            return fn(pcb_data, diff_pair, config, obstacles, *args, **kwargs)
+        added = [d for n in nets
+                 for d in copper_rule_overlay(pcb_data, n, config,
+                                              exclude=[m for m in nets if m != n])]
+        for d in added:
+            add_net_obstacles_from_cache(obstacles, d)
+        _OVERLAY_ACTIVE.update(keys)
+        try:
+            return fn(pcb_data, diff_pair, config, obstacles, *args, **kwargs)
+        finally:
+            _OVERLAY_ACTIVE.difference_update(keys)
             for d in reversed(added):
                 remove_net_obstacles_from_cache(obstacles, d)
     return wrapped
