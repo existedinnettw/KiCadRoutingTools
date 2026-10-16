@@ -53,8 +53,8 @@ iterations on detailed search.
 Deliberately NOT in v1: via-site reservations (the plan collects each rough
 route's via positions in via_sites, but folding them into the stub map
 prices them at the RIP-avoidance knobs and needs #588's scarcity thinking);
-negotiated-congestion re-probing (PathFinder v2 -- measure one cheap pass
-first); diff pairs (route_diff has the same seam; port after the
+negotiated-congestion re-probing (PathFinder v2 -- now an opt-in pass,
+KICAD_GLOBAL_PLAN_NEGOTIATE, see negotiated_plan.py); diff pairs (route_diff has the same seam; port after the
 single-ended verdict).
 """
 from __future__ import annotations
@@ -196,6 +196,7 @@ def plan_global_routes(pcb_data, config, net_ids: List[Tuple[str, int]],
             print(f"  [plan] power-first probing: "
                   f"{sum(1 for t in _probe_order if t[1] in _pw)} power "
                   f"net(s) probed ahead of signals")
+    _results: Dict[int, dict] = {}
     for _name, nid in _probe_order:
         result = route_net_with_obstacles(pcb_data, nid, rough_cfg, probe_map)
         _it = int((result or {}).get('iterations', 0) or 0)
@@ -205,6 +206,7 @@ def plan_global_routes(pcb_data, config, net_ids: List[Tuple[str, int]],
             plan.probe_failures += 1
             continue
         plan.rough_paths[nid] = result['path']
+        _results[nid] = result
         if seq_cfg is not None:
             seq_rows, _ = compute_ripped_route_costs(result, seq_cfg,
                                                      layer_map)
@@ -222,6 +224,34 @@ def plan_global_routes(pcb_data, config, net_ids: List[Tuple[str, int]],
             if via_pos:
                 plan.via_sites[nid] = via_pos
 
+    if k.get('negotiate', 0) > 0 and plan.rough_paths:
+        from negotiated_plan import negotiate, legal_map_builder, tree_route_fn
+        _order = [nid for _n, nid in _probe_order if nid in plan.rough_paths]
+        _probe = (lambda cfg, nid, obs: route_net_with_obstacles(pcb_data, nid,
+                                                                 cfg, obs))
+        _pair = None
+        if k.get('neg_tree') and k.get('neg_legal'):
+            _pair, _probe = _probe, tree_route_fn(pcb_data, _probe)
+        else:
+            k = dict(k, neg_tree=False)   # taps on the shared map would leak
+        _neg = negotiate(plan, _results, _order, probe_map, rough_cfg, config,
+                         pcb_data, k, _probe, pair_fn=_pair,
+                         build_map=(legal_map_builder(probe_map, pcb_data, config, ids)
+                                    if k.get('neg_legal') else None))
+        plan.probe_iterations += int(_neg.get('iterations', 0) or 0)
+        # Reservations and via sites describe the NEGOTIATED corridors.
+        if k['cost'] > 0:
+            plan.reservations.clear()
+            plan.via_sites.clear()
+            for nid, result in _results.items():
+                rows, via_pos = compute_ripped_route_costs(result, res_cfg,
+                                                           layer_map)
+                rows = _scale_rows_in_collars(rows, collar_rects,
+                                              k['zone_scale'])
+                if len(rows):
+                    plan.reservations[nid] = rows
+                if via_pos:
+                    plan.via_sites[nid] = via_pos
     plan.conflict_w, plan.share_w = _conflict_graphs(plan.rough_paths,
                                                      config)
     _assign_clique_layers(plan, config, pcb_data)
