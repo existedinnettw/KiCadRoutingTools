@@ -1331,7 +1331,11 @@ def copper_rule_overlay(pcb_data, net_id: int, config) -> List[NetObstacleData]:
             continue
         v = track_pair_clearance(rules, own, mem.get(nid, ()), 0.0,
                                  track=False)[0]
-        if v > config.obstacle_clearance(nid) + 1e-9:
+        # against the stamp AFTER the layer rule replaced it: a 1.0 mm floor
+        # under a 0.2 mm layer rule stamps 0.2, below a 0.75 mm class rule
+        base = config.obstacle_clearance(nid)
+        stamped = min([config.layer_clearance(l, base) for l in config.layers] or [base])
+        if v > stamped + 1e-9:
             need[nid] = v
     if not need:
         return []
