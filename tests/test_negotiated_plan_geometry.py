@@ -23,8 +23,8 @@ for p in (ROOT, _TESTS, os.path.join(ROOT, 'py_router')):
         sys.path.insert(0, p)
 
 from kicad_parser import Segment, Via  # noqa: E402
-from negotiated_plan import (_disk, _open_disk, centreline, copper_centreline,  # noqa: E402
-                             exact_rejects, seg_seg_dist)
+from negotiated_plan import (_disk, _open_disk, centreline, commit_pair_clearance,  # noqa: E402
+                             copper_centreline, exact_rejects, seg_seg_dist)
 
 
 class _Cfg:
@@ -94,6 +94,42 @@ def test_exact_rejects_tracks_by_pair_clearance():
     assert exact_rejects([1, 2], res, wide, 0.25) == {2}
 
 
+def test_exact_rejects_pairwise_rule():
+    # a .kicad_dru class-pair rule (0.75 mm between nets 1 and 2) that the
+    # class clearances (0.2) do not carry
+    a = Segment(start_x=0, start_y=0, end_x=5, end_y=0, width=0.2, layer='F.Cu', net_id=1)
+    b = Segment(start_x=0, start_y=0.6, end_x=5, end_y=0.6, width=0.2, layer='F.Cu', net_id=2)
+    size = {1: (0.2, 0.6, 0.3, 0.2), 2: (0.2, 0.6, 0.3, 0.2)}
+    res = {1: _res([a]), 2: _res([b])}
+    rule = lambda x, y, kind, layer: 0.75 if {x, y} == {1, 2} else 0.2
+    assert exact_rejects([1, 2], res, size, 0.25) == set()        # 0.4 >= 0.2
+    assert exact_rejects([1, 2], res, size, 0.25, pair_cl=rule, pair_cl_max=0.75) == {2}
+    far = {1: _res([a]), 2: _res([Segment(start_x=0, start_y=0.95, end_x=5, end_y=0.95,
+                                          width=0.2, layer='F.Cu', net_id=2)])}
+    assert exact_rejects([1, 2], far, size, 0.25, pair_cl=rule, pair_cl_max=0.75) == set()  # 0.75 exactly
+
+
+def test_exact_rejects_pair_rule_per_geometry():
+    # a track-only 0.75 mm rule: two vias 0.7 mm apart edge to edge are
+    # graded at the via-stack value (0.2) and pass; two tracks at 0.6 fail
+    tr = lambda x, y, kind, layer: 0.75 if kind == 'track' else 0.2
+    v1, v2 = Via(x=0, y=0, size=0.6, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=1), \
+        Via(x=1.3, y=0, size=0.6, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=2)
+    size = {1: (0.2, 0.6, 0.3, 0.2), 2: (0.2, 0.6, 0.3, 0.2)}
+    assert exact_rejects([1, 2], {1: _res(vias=[v1]), 2: _res(vias=[v2])}, size, 0.25,
+                         pair_cl=tr, pair_cl_max=0.75) == set()
+    a = Segment(start_x=0, start_y=0, end_x=5, end_y=0, width=0.2, layer='F.Cu', net_id=1)
+    b = Segment(start_x=0, start_y=0.8, end_x=5, end_y=0.8, width=0.2, layer='F.Cu', net_id=2)
+    assert exact_rejects([1, 2], {1: _res([a]), 2: _res([b])}, size, 0.25,
+                         pair_cl=tr, pair_cl_max=0.75) == {2}
+    # a rule on F.Cu only does not reach a pair of B.Cu tracks
+    fl = lambda x, y, kind, layer: 0.75 if layer == 'F.Cu' else 0.2
+    a2 = Segment(start_x=0, start_y=0, end_x=5, end_y=0, width=0.2, layer='B.Cu', net_id=1)
+    b2 = Segment(start_x=0, start_y=0.8, end_x=5, end_y=0.8, width=0.2, layer='B.Cu', net_id=2)
+    assert exact_rejects([1, 2], {1: _res([a2]), 2: _res([b2])}, size, 0.25,
+                         pair_cl=fl, pair_cl_max=0.75) == set()
+
+
 def test_exact_rejects_via_hole_to_hole():
     v1 = Via(x=0, y=0, size=0.4, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=1)
     v2 = Via(x=0.65, y=0, size=0.4, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=2)
@@ -115,3 +151,34 @@ def test_exact_rejects_copper_to_hole():
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-q']))
+
+
+def test_commit_pair_clearance_track_rules_pair_exact():
+    # an other_only track rule on class C: binds C vs non-C tracks only,
+    # never two non-C nets, and never a via pair
+    from kicad_dru import TrackRule
+    from routing_config import GridRouteConfig
+    cfg = GridRouteConfig(clearance=0.2)
+    # the shared obstacle map over-approximates: with a C net routed, every
+    # non-C net is stamped at the rule value
+    cfg.track_clearances = {1: 0.75, 2: 0.75, 3: 0.75}
+    rule = TrackRule(name='r', cls='C', other_only=True, clearance_mm=0.75, scope='track')
+    mem = {1: frozenset({'C'}), 2: frozenset({'Default'}), 3: frozenset({'Default'})}
+    cl = commit_pair_clearance(cfg, [rule], mem)
+    assert cl(1, 2, 'track', 'F.Cu') == 0.75
+    assert cl(2, 3, 'track', 'F.Cu') == 0.2       # two non-C nets: unbound
+    assert cl(1, 2, 'layer', 'F.Cu') == 0.2       # track-via: a track rule does not apply
+    assert cl(1, 2, 'stack', None) == 0.2
+
+
+def test_commit_pair_clearance_forwarded_map_without_rules():
+    # the final reconciliation: no .kicad_dru beside the output board, the
+    # resolved per-net track map forwarded; track pairs fall back to it
+    from routing_config import GridRouteConfig
+    cfg = GridRouteConfig(clearance=0.2)
+    cfg.track_clearances = {1: 0.75, 2: 0.75}
+    cl = commit_pair_clearance(cfg, [], {})
+    assert cl(1, 2, 'track', 'F.Cu') == 0.75
+    assert cl(1, 2, 'layer', 'F.Cu') == 0.2
+    assert cl(1, 2, 'stack', None) == 0.2
+
