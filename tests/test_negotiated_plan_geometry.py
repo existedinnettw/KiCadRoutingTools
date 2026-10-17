@@ -94,6 +94,42 @@ def test_exact_rejects_tracks_by_pair_clearance():
     assert exact_rejects([1, 2], res, wide, 0.25) == {2}
 
 
+def test_exact_rejects_pairwise_rule():
+    # a .kicad_dru class-pair rule (0.75 mm between nets 1 and 2) that the
+    # class clearances (0.2) do not carry
+    a = Segment(start_x=0, start_y=0, end_x=5, end_y=0, width=0.2, layer='F.Cu', net_id=1)
+    b = Segment(start_x=0, start_y=0.6, end_x=5, end_y=0.6, width=0.2, layer='F.Cu', net_id=2)
+    size = {1: (0.2, 0.6, 0.3, 0.2), 2: (0.2, 0.6, 0.3, 0.2)}
+    res = {1: _res([a]), 2: _res([b])}
+    rule = lambda x, y, kind, layer: 0.75 if {x, y} == {1, 2} else 0.2
+    assert exact_rejects([1, 2], res, size, 0.25) == set()        # 0.4 >= 0.2
+    assert exact_rejects([1, 2], res, size, 0.25, pair_cl=rule, pair_cl_max=0.75) == {2}
+    far = {1: _res([a]), 2: _res([Segment(start_x=0, start_y=0.95, end_x=5, end_y=0.95,
+                                          width=0.2, layer='F.Cu', net_id=2)])}
+    assert exact_rejects([1, 2], far, size, 0.25, pair_cl=rule, pair_cl_max=0.75) == set()  # 0.75 exactly
+
+
+def test_exact_rejects_pair_rule_per_geometry():
+    # a track-only 0.75 mm rule: two vias 0.7 mm apart edge to edge are
+    # graded at the via-stack value (0.2) and pass; two tracks at 0.6 fail
+    tr = lambda x, y, kind, layer: 0.75 if kind == 'track' else 0.2
+    v1, v2 = Via(x=0, y=0, size=0.6, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=1), \
+        Via(x=1.3, y=0, size=0.6, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=2)
+    size = {1: (0.2, 0.6, 0.3, 0.2), 2: (0.2, 0.6, 0.3, 0.2)}
+    assert exact_rejects([1, 2], {1: _res(vias=[v1]), 2: _res(vias=[v2])}, size, 0.25,
+                         pair_cl=tr, pair_cl_max=0.75) == set()
+    a = Segment(start_x=0, start_y=0, end_x=5, end_y=0, width=0.2, layer='F.Cu', net_id=1)
+    b = Segment(start_x=0, start_y=0.8, end_x=5, end_y=0.8, width=0.2, layer='F.Cu', net_id=2)
+    assert exact_rejects([1, 2], {1: _res([a]), 2: _res([b])}, size, 0.25,
+                         pair_cl=tr, pair_cl_max=0.75) == {2}
+    # a rule on F.Cu only does not reach a pair of B.Cu tracks
+    fl = lambda x, y, kind, layer: 0.75 if layer == 'F.Cu' else 0.2
+    a2 = Segment(start_x=0, start_y=0, end_x=5, end_y=0, width=0.2, layer='B.Cu', net_id=1)
+    b2 = Segment(start_x=0, start_y=0.8, end_x=5, end_y=0.8, width=0.2, layer='B.Cu', net_id=2)
+    assert exact_rejects([1, 2], {1: _res([a2]), 2: _res([b2])}, size, 0.25,
+                         pair_cl=fl, pair_cl_max=0.75) == set()
+
+
 def test_exact_rejects_via_hole_to_hole():
     v1 = Via(x=0, y=0, size=0.4, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=1)
     v2 = Via(x=0.65, y=0, size=0.4, drill=0.3, layers=['F.Cu', 'B.Cu'], net_id=2)
