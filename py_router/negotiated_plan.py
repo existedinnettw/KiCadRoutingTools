@@ -248,15 +248,51 @@ def seg_seg_dist(a, b) -> float:
     return min(_pt_seg(*p1, *b), _pt_seg(*p2, *b), _pt_seg(*q1, *a), _pt_seg(*q2, *a))
 
 
+def commit_pair_clearance(config, track_rules, memberships):
+    """``pair_cl(a, b, kind, layer)`` for exact_rejects: the board's pairwise
+    clearance per geometry, as check_drc grades it. 'stack' (via-via) and
+    'layer' (track-via) from config.pair_clearance; 'track' (track-track)
+    then raised pair-exactly by the track-scope rules ``track_rules`` with
+    the nets' class ``memberships`` (kicad_dru.board_track_rules).
+    config.track_clearances is used only when no rules are given (a sub-run
+    handed the resolved map without the board's .kicad_dru): it is the
+    shared obstacle map's per-net over-approximation and would otherwise
+    refuse legal copper between two nets the rule does not bind."""
+    from kicad_dru import track_pair_clearance
+
+    def pair_cl(a, b, kind, layer):
+        if kind == 'stack':
+            return config.pair_clearance(a, b, kind='stack')
+        if kind == 'track' and not track_rules and config.track_clearances:
+            # no rule metadata to resolve pairs exactly (the final
+            # reconciliation reads the output board, whose .kicad_dru is
+            # copied after the run, and gets the resolved map forwarded):
+            # the forwarded per-net map, conservative but never below a rule
+            return config.pair_clearance(a, b, layer, kind='track')
+        v = config.pair_clearance(a, b, layer, kind='layer')
+        if kind == 'track' and track_rules:
+            v = track_pair_clearance(track_rules, memberships.get(a, ()),
+                                     memberships.get(b, ()), v, track=True)[0]
+        return v
+    return pair_cl
+
+
 def exact_rejects(cand: List[int], results: Dict[int, dict],
                   net_size: Dict[int, tuple], h2h: float,
-                  hole_cl: float = 0.0) -> set:
+                  hole_cl: float = 0.0, pair_cl=None,
+                  pair_cl_max: float = 0.0) -> set:
     """Nets of ``cand`` (in order) whose probe copper violates clearance to a
     net accepted before them, on the real geometry: track-track on a shared
     layer, track-via (also copper to the via's drill at ``hole_cl``, KiCad's
     min_hole_clearance), via-via (also drill hole-to-hole), each pair at
     max(cl_a, cl_b). ``net_size[n]`` = (track width, via diameter, via
-    drill, clearance); the copper's own widths and sizes are used."""
+    drill, clearance); the copper's own widths and sizes are used.
+    ``pair_cl(a, b, kind, layer)``, when given, replaces max(cl_a, cl_b)
+    with the board's pairwise value for each geometry, as check_drc grades
+    it: kind 'track' on the shared layer for track-track, 'layer' on the
+    track's layer for track-via, 'stack' for via-via (e.g. a .kicad_dru
+    net-class pair rule, which the class clearances do not carry);
+    ``pair_cl_max`` bounds it for the prefilter."""
     def copper(n):
         r = results.get(n) or {}
         segs = [(sg.layer, (sg.start_x, sg.start_y, sg.end_x, sg.end_y), sg.width)
@@ -276,22 +312,23 @@ def exact_rejects(cand: List[int], results: Dict[int, dict],
         return a and b and not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 
     def clash(ca, cb, cl):
+        """``cl(kind, layer)``: the pair's clearance for that geometry."""
         (sa, va), (sb, vb) = ca, cb
         for la, ga, wa in sa:
             for lb, gb, wb in sb:
-                if la == lb and seg_seg_dist(ga, gb) < wa / 2 + wb / 2 + cl - 1e-6:
+                if la == lb and seg_seg_dist(ga, gb) < wa / 2 + wb / 2 + cl('track', la) - 1e-6:
                     return True
             for x, y, d, dr in vb:
-                if _pt_seg(x, y, *ga) < max(wa / 2 + d / 2 + cl,
+                if _pt_seg(x, y, *ga) < max(wa / 2 + d / 2 + cl('layer', la),
                                             wa / 2 + dr / 2 + hole_cl) - 1e-6:
                     return True
         for x, y, d, dr in va:
             for lb, gb, wb in sb:
-                if _pt_seg(x, y, *gb) < max(d / 2 + wb / 2 + cl,
+                if _pt_seg(x, y, *gb) < max(d / 2 + wb / 2 + cl('layer', lb),
                                             dr / 2 + wb / 2 + hole_cl) - 1e-6:
                     return True
             for x2, y2, d2, dr2 in vb:
-                need = max(d / 2 + d2 / 2 + cl, dr / 2 + dr2 / 2 + h2h)
+                need = max(d / 2 + d2 / 2 + cl('stack', None), dr / 2 + dr2 / 2 + h2h)
                 if math.hypot(x - x2, y - y2) < need - 1e-6:
                     return True
         return False
@@ -303,7 +340,7 @@ def exact_rejects(cand: List[int], results: Dict[int, dict],
     half = max([w / 2 for segs, _v in info.values() for _l, _g, w in segs]
                + [d / 2 for _s, vias in info.values() for _x, _y, d, _dr in vias] + [0.0])
     drill = max([dr for _s, vias in info.values() for _x, _y, _d, dr in vias] + [0.0])
-    cl_max = max([(net_size.get(n) or (0, 0, 0, 0.0))[3] for n in cand] + [0.0])
+    cl_max = max([(net_size.get(n) or (0, 0, 0, 0.0))[3] for n in cand] + [pair_cl_max, 0.0])
     pad = max(half + cl_max / 2, drill / 2 + h2h / 2,
               (half + drill / 2 + hole_cl) / 2) + 1e-3
     info = {n: (cu, box(*cu, pad)) for n, cu in info.items()}
@@ -315,7 +352,16 @@ def exact_rejects(cand: List[int], results: Dict[int, dict],
             cm, bm = info[m]
             if not overlap(bx, bm):
                 continue
-            cl = max(cl_n, (net_size.get(m) or (0, 0, 0, 0.0))[3])
+            if pair_cl is None:
+                flat = max(cl_n, (net_size.get(m) or (0, 0, 0, 0.0))[3])
+                cl = lambda _kind, _layer, _v=flat: _v
+            else:
+                memo = {}
+
+                def cl(kind, layer, _m=m, _memo=memo):
+                    if (kind, layer) not in _memo:
+                        _memo[kind, layer] = pair_cl(n, _m, kind, layer)
+                    return _memo[kind, layer]
             if clash(cu, cm, cl):
                 bad = True
                 break
@@ -626,8 +672,19 @@ def negotiate(plan, results: Dict[int, dict], order: List[int], probe_map,
         cand = [n for n in order if n in plan.negotiated_legal
                 and n not in plan.negotiated_conflicted]
         from obstacle_map import resolve_hole_clearance
+        pair_cl, pair_cl_max = None, 0.0
+        if hasattr(config, 'pair_clearance_inert') and not config.pair_clearance_inert():
+            # the board's pairwise rules per geometry and layer, as check_drc
+            # grades them. Track rules pair-exactly from the board's rules and
+            # memberships: config.track_clearances is the shared obstacle
+            # map's per-net over-approximation, which would refuse legal
+            # copper between two nets the rule does not bind.
+            from kicad_dru import board_track_rules
+            pair_cl = commit_pair_clearance(config, *board_track_rules(pcb_data))
+            pair_cl_max = config.max_pair_clearance()
         rejected = exact_rejects(cand, results, net_size, h2h,
-                                 float(resolve_hole_clearance(pcb_data, config) or 0.0))
+                                 float(resolve_hole_clearance(pcb_data, config) or 0.0),
+                                 pair_cl=pair_cl, pair_cl_max=pair_cl_max)
         stats['exact_rejected'] = len(rejected)
         plan.negotiated_conflicted |= rejected
     dump = k.get('neg_dump')
