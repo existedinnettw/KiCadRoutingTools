@@ -175,6 +175,8 @@ REGISTRY = {
     'py_router/cli_banner.py': (
         'reporting', "the CLI's whole-run `Wall time:` line before EXIT="),
     'py_router/global_plan.py': ('reporting', 'plan timing print'),
+    'py_router/negotiated_plan.py': ('reporting', "stats['seconds'] and the "
+                                     "negotiated plan's summary print"),
     'py_router/leg_rip.py': ('reporting', 'per-rip ms print'),
     'py_router/net_rescue.py': ('reporting', "per-net timing and summary['time']"),
     'py_router/phase3_routing.py': ('reporting', 'stats.total_time'),

@@ -398,6 +398,8 @@ REFUSAL_SITES = {
         'if not zone_pairs': ('board', "zones auto-detected from the board"),
         'if LAST_RIPPED_STILL_OPEN':
             ('after the run', 'rip casualties ship open: exit 4'),
+        'if LAST_REGRESSED_SIGNAL_NETS':
+            ('after the run', 'signal nets lost on the written board: exit 4'),
         'call:finish_design_rules': ('after the run', '--strict-sizes: exit 3 after routing'),
     },
     'bga_fanout.py': {

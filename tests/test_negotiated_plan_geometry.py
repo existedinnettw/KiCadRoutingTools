@@ -148,11 +148,6 @@ def test_exact_rejects_copper_to_hole():
     assert exact_rejects([1, 2], res, size, 0.25, hole_cl=0.3) == {2}    # drill edge 0.25 < 0.3
 
 
-if __name__ == '__main__':
-    import pytest
-    sys.exit(pytest.main([__file__, '-q']))
-
-
 def test_commit_pair_clearance_track_rules_pair_exact():
     # an other_only track rule on class C: binds C vs non-C tracks only,
     # never two non-C nets, and never a via pair
@@ -182,3 +177,10 @@ def test_commit_pair_clearance_forwarded_map_without_rules():
     assert cl(1, 2, 'layer', 'F.Cu') == 0.2
     assert cl(1, 2, 'stack', None) == 0.2
 
+
+if __name__ == '__main__':
+    for _name, _fn in sorted(globals().items()):
+        if _name.startswith('test_') and callable(_fn):
+            print(f'--- {_name}')
+            _fn()
+    print('ALL PASS')
